@@ -1,0 +1,1919 @@
+name: Telegram 3D Asset Importer
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Telegram channel username"
+        required: true
+        default: "svalkacg"
+
+      message_id:
+        description: "Telegram message ID"
+        required: true
+        default: "3875"
+
+      prefix:
+        description: "Archive filename prefix"
+        required: true
+        default: "iCity Cyberpunk"
+
+      max_depth:
+        description: "Maximum nested archive depth"
+        required: true
+        default: "10"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-3d-import
+  cancel-in-progress: false
+
+jobs:
+
+  import-3d-assets:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    env:
+      CHANNEL: ${{ inputs.channel }}
+      MESSAGE_ID: ${{ inputs.message_id }}
+      ARCHIVE_PREFIX: ${{ inputs.prefix }}
+      MAX_ARCHIVE_DEPTH: ${{ inputs.max_depth }}
+
+    steps:
+
+      # ==========================================================
+      # 1. CHECKOUT
+      # ==========================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      # ==========================================================
+      # 2. SYSTEM INFORMATION
+      # ==========================================================
+
+      - name: System information
+        run: |
+          echo "CPU:"
+          nproc
+
+          echo
+          echo "Memory:"
+          free -h
+
+          echo
+          echo "Disk:"
+          df -h
+
+      # ==========================================================
+      # 3. INSTALL TOOLS
+      # ==========================================================
+
+      - name: Install archive tools
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            p7zip-full \
+            p7zip-rar \
+            unrar \
+            unzip \
+            jq \
+            file \
+            tree
+
+          python3 -m pip install --upgrade pip
+
+          python3 -m pip install \
+            telethon
+
+      # ==========================================================
+      # 4. RESTORE TELEGRAM SESSION
+      # ==========================================================
+
+      - name: Restore Telegram session
+        env:
+          TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
+
+        run: |
+
+          if [ -z "$TELEGRAM_SESSION_B64" ]; then
+            echo "::error::TELEGRAM_SESSION_B64 is missing"
+            exit 1
+          fi
+
+          printf '%s' "$TELEGRAM_SESSION_B64" \
+            | base64 -d \
+            > telegram_session.session
+
+          chmod 600 telegram_session.session
+
+          ls -lh telegram_session.session
+
+      # ==========================================================
+      # 5. DISCOVER TELEGRAM ARCHIVES
+      # ==========================================================
+
+      - name: Create Telegram discovery script
+        run: |
+
+          cat > telegram_discover.py <<'PY'
+
+          import os
+          import json
+          import asyncio
+
+          from telethon import TelegramClient
+
+
+          API_ID = int(
+              os.environ["TELEGRAM_API_ID"]
+          )
+
+          API_HASH = os.environ[
+              "TELEGRAM_API_HASH"
+          ]
+
+          CHANNEL = os.environ[
+              "CHANNEL"
+          ]
+
+          MESSAGE_ID = int(
+              os.environ["MESSAGE_ID"]
+          )
+
+          PREFIX = os.environ[
+              "ARCHIVE_PREFIX"
+          ]
+
+
+          ARCHIVE_EXTENSIONS = (
+
+              ".rar",
+              ".zip",
+              ".7z",
+
+              ".tar",
+              ".tar.gz",
+              ".tgz",
+
+              ".tar.bz2",
+              ".tbz2",
+
+              ".tar.xz",
+              ".txz",
+
+          )
+
+
+          async def main():
+
+              client = TelegramClient(
+                  "telegram_session",
+                  API_ID,
+                  API_HASH
+              )
+
+              await client.start()
+
+              print(
+                  f"Searching {CHANNEL}"
+              )
+
+              print(
+                  f"Around message {MESSAGE_ID}"
+              )
+
+              start_id = max(
+                  1,
+                  MESSAGE_ID - 1500
+              )
+
+              end_id = (
+                  MESSAGE_ID + 1500
+              )
+
+              found = {}
+
+              async for message in client.iter_messages(
+
+                  CHANNEL,
+
+                  min_id=start_id,
+
+                  max_id=end_id
+
+              ):
+
+                  if not message.file:
+                      continue
+
+                  name = (
+                      message.file.name
+                      or ""
+                  )
+
+                  lower = name.lower()
+
+                  if PREFIX:
+
+                      if not name.startswith(
+                          PREFIX
+                      ):
+                          continue
+
+                  if not any(
+
+                      lower.endswith(ext)
+
+                      for ext
+                      in ARCHIVE_EXTENSIONS
+
+                  ):
+
+                      continue
+
+                  found[
+                      message.id
+                  ] = {
+
+                      "message_id":
+                          message.id,
+
+                      "name":
+                          name,
+
+                      "size":
+                          message.file.size,
+
+                      "size_gib":
+                          round(
+                              message.file.size
+                              / (1024 ** 3),
+                              4
+                          )
+
+                  }
+
+              await client.disconnect()
+
+              results = list(
+                  found.values()
+              )
+
+              results.sort(
+                  key=lambda x:
+                      x["message_id"]
+              )
+
+              if not results:
+
+                  raise RuntimeError(
+                      "No archives found."
+                  )
+
+              print()
+              print(
+                  "=============================="
+              )
+
+              print(
+                  "ARCHIVES FOUND"
+              )
+
+              print(
+                  "=============================="
+              )
+
+              for item in results:
+
+                  print(
+                      f"{item['message_id']} "
+                      f"{item['name']} "
+                      f"{item['size_gib']} GiB"
+                  )
+
+              with open(
+                  "telegram_archives.json",
+                  "w"
+              ) as f:
+
+                  json.dump(
+                      results,
+                      f,
+                      indent=2
+                  )
+
+
+          asyncio.run(main())
+
+          PY
+
+      - name: Discover Telegram archives
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+
+        run: |
+
+          python3 telegram_discover.py
+
+          cat telegram_archives.json
+
+      # ==========================================================
+      # 6. DOWNLOAD ENGINE
+      # ==========================================================
+
+      - name: Create resilient Telegram downloader
+        run: |
+
+          cat > telegram_download.py <<'PY'
+
+          import os
+          import json
+          import asyncio
+
+          from telethon import TelegramClient
+
+
+          API_ID = int(
+              os.environ["TELEGRAM_API_ID"]
+          )
+
+          API_HASH = os.environ[
+              "TELEGRAM_API_HASH"
+          ]
+
+          CHANNEL = os.environ[
+              "CHANNEL"
+          ]
+
+
+          CHUNK_SIZE = (
+              8 * 1024 * 1024
+          )
+
+          MAX_RETRIES = 10
+
+
+          async def download_message(
+
+              client,
+              message,
+              destination
+
+          ):
+
+              expected = (
+                  message.file.size
+              )
+
+              partial = (
+                  destination
+                  + ".part"
+              )
+
+              checkpoint = (
+                  destination
+                  + ".checkpoint"
+              )
+
+              if os.path.exists(
+                  partial
+              ):
+
+                  current = os.path.getsize(
+                      partial
+                  )
+
+                  if current > expected:
+
+                      print(
+                          "Invalid partial file."
+                      )
+
+                      os.remove(
+                          partial
+                      )
+
+              for attempt in range(
+
+                  1,
+                  MAX_RETRIES + 1
+
+              ):
+
+                  try:
+
+                      current = (
+
+                          os.path.getsize(
+                              partial
+                          )
+
+                          if os.path.exists(
+                              partial
+                          )
+
+                          else 0
+
+                      )
+
+                      print()
+                      print(
+                          f"Downloading "
+                          f"{message.file.name}"
+                      )
+
+                      print(
+                          f"Resume: "
+                          f"{current / 1024**3:.3f} "
+                          f"/ "
+                          f"{expected / 1024**3:.3f} GiB"
+                      )
+
+                      with open(
+                          partial,
+                          "ab"
+                      ) as f:
+
+                          async for chunk in client.iter_download(
+
+                              message.media,
+
+                              offset=current,
+
+                              request_size=CHUNK_SIZE
+
+                          ):
+
+                              f.write(chunk)
+
+                              f.flush()
+
+                              os.fsync(
+                                  f.fileno()
+                              )
+
+                              current += len(
+                                  chunk
+                              )
+
+                              with open(
+                                  checkpoint,
+                                  "w"
+                              ) as cp:
+
+                                  json.dump(
+
+                                      {
+
+                                          "file":
+                                              message.file.name,
+
+                                          "expected":
+                                              expected,
+
+                                          "downloaded":
+                                              current,
+
+                                          "status":
+                                              "downloading"
+
+                                      },
+
+                                      cp
+
+                                  )
+
+                              print(
+
+                                  f"\r"
+                                  f"{current / 1024**3:.3f}"
+                                  f" / "
+                                  f"{expected / 1024**3:.3f}"
+                                  f" GiB",
+
+                                  end="",
+
+                                  flush=True
+
+                              )
+
+                      final_size = (
+                          os.path.getsize(
+                              partial
+                          )
+                      )
+
+                      print()
+
+                      if final_size != expected:
+
+                          raise RuntimeError(
+
+                              f"Size mismatch: "
+                              f"{final_size} != "
+                              f"{expected}"
+
+                          )
+
+                      os.replace(
+                          partial,
+                          destination
+                      )
+
+                      with open(
+                          checkpoint,
+                          "w"
+                      ) as cp:
+
+                          json.dump(
+
+                              {
+
+                                  "file":
+                                      message.file.name,
+
+                                  "expected":
+                                      expected,
+
+                                  "downloaded":
+                                      expected,
+
+                                  "status":
+                                      "completed"
+
+                              },
+
+                              cp
+
+                          )
+
+                      print(
+                          "DOWNLOAD COMPLETE"
+                      )
+
+                      return
+
+                  except Exception as error:
+
+                      print()
+
+                      print(
+                          f"Attempt "
+                          f"{attempt}/"
+                          f"{MAX_RETRIES} failed:"
+                      )
+
+                      print(
+                          repr(error)
+                      )
+
+                      if attempt >= MAX_RETRIES:
+
+                          raise
+
+                      wait = min(
+                          180,
+                          attempt * 15
+                      )
+
+                      print(
+                          f"Waiting {wait}s..."
+                      )
+
+                      await asyncio.sleep(
+                          wait
+                      )
+
+
+          async def main():
+
+              client = TelegramClient(
+
+                  "telegram_session",
+
+                  API_ID,
+
+                  API_HASH
+
+              )
+
+              await client.start()
+
+              os.makedirs(
+                  "downloads",
+                  exist_ok=True
+              )
+
+              with open(
+                  "telegram_archives.json"
+              ) as f:
+
+                  archives = json.load(f)
+
+              for item in archives:
+
+                  message = (
+                      await client.get_messages(
+
+                          CHANNEL,
+
+                          ids=item[
+                              "message_id"
+                          ]
+
+                      )
+                  )
+
+                  if not message:
+
+                      raise RuntimeError(
+
+                          f"Message "
+                          f"{item['message_id']} "
+                          f"not found."
+
+                      )
+
+                  path = os.path.join(
+
+                      "downloads",
+
+                      item["name"]
+
+                  )
+
+                  if os.path.exists(path):
+
+                      if (
+
+                          os.path.getsize(path)
+                          == item["size"]
+
+                      ):
+
+                          print(
+                              f"Already downloaded: "
+                              f"{item['name']}"
+                          )
+
+                          continue
+
+                  await download_message(
+
+                      client,
+
+                      message,
+
+                      path
+
+                  )
+
+              await client.disconnect()
+
+
+          asyncio.run(main())
+
+          PY
+
+      - name: Download Telegram archives
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+
+        run: |
+
+          python3 telegram_download.py
+
+      # ==========================================================
+      # 7. SHA256 VERIFICATION
+      # ==========================================================
+
+      - name: Verify downloaded files
+        run: |
+
+          mkdir -p checksums
+
+          for file in downloads/*; do
+
+            [ -f "$file" ] || continue
+
+            sha256sum "$file" \
+              >> checksums/SHA256SUMS.txt
+
+          done
+
+          cat checksums/SHA256SUMS.txt
+
+          python3 - <<'PY'
+
+          import os
+          import json
+
+          with open(
+              "telegram_archives.json"
+          ) as f:
+
+              archives = json.load(f)
+
+          for item in archives:
+
+              path = os.path.join(
+
+                  "downloads",
+
+                  item["name"]
+
+              )
+
+              if not os.path.isfile(path):
+
+                  raise RuntimeError(
+                      f"Missing: {path}"
+                  )
+
+              actual = os.path.getsize(
+                  path
+              )
+
+              expected = item[
+                  "size"
+              ]
+
+              if actual != expected:
+
+                  raise RuntimeError(
+
+                      f"Size mismatch: "
+                      f"{item['name']}"
+
+                  )
+
+              print(
+                  f"OK: {item['name']}"
+              )
+
+          PY
+
+      # ==========================================================
+      # 8. TEST ARCHIVES
+      # ==========================================================
+
+      - name: Test archives
+        run: |
+
+          for archive in downloads/*; do
+
+            [ -f "$archive" ] || continue
+
+            echo
+            echo "Testing:"
+            echo "$archive"
+
+            7z t "$archive" -y
+
+          done
+
+      # ==========================================================
+      # 9. EXTRACT FIRST LEVEL
+      # ==========================================================
+
+      - name: Extract root archives
+        run: |
+
+          mkdir -p extracted
+
+          for archive in downloads/*; do
+
+            [ -f "$archive" ] || continue
+
+            filename="$(
+              basename "$archive"
+            )"
+
+            destination="extracted/${filename}_root"
+
+            mkdir -p "$destination"
+
+            echo
+            echo "Extracting:"
+            echo "$archive"
+
+            7z x \
+
+              "$archive" \
+
+              "-o$destination" \
+
+              -y \
+
+              -aoa
+
+          done
+
+      # ==========================================================
+      # 10. NESTED ARCHIVE ENGINE — 10 LEVELS
+      # ==========================================================
+
+      - name: Recursive extraction
+        run: |
+
+          cat > recursive_extract.py <<'PY'
+
+          import os
+          import json
+          import subprocess
+
+          from pathlib import Path
+
+
+          ROOT = Path(
+              "extracted"
+          ).resolve()
+
+
+          MAX_DEPTH = int(
+
+              os.environ.get(
+
+                  "MAX_ARCHIVE_DEPTH",
+
+                  "10"
+
+              )
+
+          )
+
+
+          EXTENSIONS = (
+
+              ".zip",
+              ".rar",
+              ".7z",
+
+              ".tar",
+              ".tar.gz",
+              ".tgz",
+
+              ".tar.bz2",
+              ".tbz2",
+
+              ".tar.xz",
+              ".txz"
+
+          )
+
+
+          processed = set()
+
+          extraction_log = []
+
+
+          def is_archive(path):
+
+              name = (
+                  path.name.lower()
+              )
+
+              return any(
+
+                  name.endswith(ext)
+
+                  for ext
+                  in EXTENSIONS
+
+              )
+
+
+          def safe_path(path):
+
+              resolved = (
+                  path.resolve()
+              )
+
+              root = str(ROOT)
+
+              return (
+
+                  resolved == ROOT
+
+                  or
+
+                  str(resolved).startswith(
+                      root + os.sep
+                  )
+
+              )
+
+
+          for depth in range(
+
+              1,
+              MAX_DEPTH + 1
+
+          ):
+
+              archives = []
+
+              for path in ROOT.rglob("*"):
+
+                  if not path.is_file():
+                      continue
+
+                  if not is_archive(path):
+                      continue
+
+                  resolved = str(
+                      path.resolve()
+                  )
+
+                  if resolved in processed:
+                      continue
+
+                  if not safe_path(path):
+
+                      raise RuntimeError(
+
+                          "Unsafe path: "
+                          + str(path)
+
+                      )
+
+                  archives.append(path)
+
+              if not archives:
+
+                  print(
+                      f"No more archives "
+                      f"at depth {depth}."
+                  )
+
+                  break
+
+              print()
+              print(
+                  f"ARCHIVE DEPTH {depth}"
+              )
+
+              for archive in archives:
+
+                  resolved = str(
+                      archive.resolve()
+                  )
+
+                  processed.add(
+                      resolved
+                  )
+
+                  destination = (
+
+                      archive.parent
+                      /
+                      (
+                          archive.stem
+                          +
+                          "_extracted"
+                      )
+
+                  )
+
+                  destination.mkdir(
+
+                      parents=True,
+
+                      exist_ok=True
+
+                  )
+
+                  print(
+                      "Extracting:"
+                  )
+
+                  print(
+                      archive
+                  )
+
+                  subprocess.run(
+
+                      [
+
+                          "7z",
+
+                          "x",
+
+                          str(archive),
+
+                          f"-o{destination}",
+
+                          "-y",
+
+                          "-aoa"
+
+                      ],
+
+                      check=True
+
+                  )
+
+                  extraction_log.append({
+
+                      "depth":
+                          depth,
+
+                      "archive":
+                          str(archive),
+
+                      "destination":
+                          str(destination)
+
+                  })
+
+
+          with open(
+
+              "extraction-log.json",
+
+              "w"
+
+          ) as f:
+
+              json.dump(
+
+                  extraction_log,
+
+                  f,
+
+                  indent=2
+
+              )
+
+          print()
+          print(
+              "Extraction finished."
+          )
+
+          print(
+              f"Maximum depth: "
+              f"{MAX_DEPTH}"
+          )
+
+          PY
+
+          python3 recursive_extract.py
+
+      # ==========================================================
+      # 11. DETECT 3D ASSETS
+      # ==========================================================
+
+      - name: Detect 3D assets
+        run: |
+
+          cat > analyze_3d.py <<'PY'
+
+          import os
+          import json
+          import hashlib
+
+          from pathlib import Path
+
+
+          ROOT = Path(
+              "extracted"
+          )
+
+
+          FORMATS = {
+
+              "3d_model": {
+
+                  ".blend",
+                  ".fbx",
+                  ".obj",
+                  ".glb",
+                  ".gltf",
+                  ".dae",
+                  ".3ds",
+                  ".stl",
+                  ".ply",
+                  ".abc",
+
+                  ".usd",
+                  ".usda",
+                  ".usdc",
+                  ".usdz",
+
+                  ".max",
+                  ".ma",
+                  ".mb",
+                  ".c4d"
+
+              },
+
+              "texture": {
+
+                  ".png",
+                  ".jpg",
+                  ".jpeg",
+                  ".webp",
+                  ".tga",
+                  ".bmp",
+                  ".tif",
+                  ".tiff",
+                  ".exr",
+                  ".hdr",
+                  ".dds"
+
+              },
+
+              "material": {
+
+                  ".mtl",
+                  ".sbs",
+                  ".sbsar"
+
+              },
+
+              "animation": {
+
+                  ".bvh",
+                  ".abc"
+
+              },
+
+              "shader": {
+
+                  ".osl",
+                  ".hlsl",
+                  ".glsl"
+
+              },
+
+              "scene": {
+
+                  ".unity",
+                  ".umap"
+
+              },
+
+              "document": {
+
+                  ".psd",
+                  ".pdf",
+                  ".txt",
+                  ".json",
+                  ".xml"
+
+              }
+
+          }
+
+
+          EXTENSION_TYPE = {}
+
+          for category, extensions in FORMATS.items():
+
+              for extension in extensions:
+
+                  EXTENSION_TYPE[
+                      extension
+                  ] = category
+
+
+          def sha256(path):
+
+              h = hashlib.sha256()
+
+              with open(
+                  path,
+                  "rb"
+              ) as f:
+
+                  while True:
+
+                      data = f.read(
+                          8 * 1024 * 1024
+                      )
+
+                      if not data:
+                          break
+
+                      h.update(data)
+
+              return h.hexdigest()
+
+
+          assets = []
+
+          for path in ROOT.rglob("*"):
+
+              if not path.is_file():
+                  continue
+
+              extension = (
+                  path.suffix.lower()
+              )
+
+              category = (
+                  EXTENSION_TYPE.get(
+                      extension
+                  )
+              )
+
+              if not category:
+                  continue
+
+              size = path.stat().st_size
+
+              assets.append({
+
+                  "path":
+                      str(path),
+
+                  "filename":
+                      path.name,
+
+                  "extension":
+                      extension,
+
+                  "type":
+                      category,
+
+                  "size":
+                      size,
+
+                  "size_mb":
+                      round(
+                          size / 1024**2,
+                          3
+                      ),
+
+                  "sha256":
+                      sha256(path)
+
+              })
+
+
+          assets.sort(
+              key=lambda x:
+                  x["path"]
+          )
+
+
+          with open(
+
+              "ASSET_MANIFEST.json",
+
+              "w"
+
+          ) as f:
+
+              json.dump(
+
+                  assets,
+
+                  f,
+
+                  indent=2
+
+              )
+
+
+          categories = {}
+
+          for asset in assets:
+
+              categories.setdefault(
+
+                  asset["type"],
+
+                  0
+
+              )
+
+              categories[
+                  asset["type"]
+              ] += 1
+
+
+          print()
+          print(
+              "3D ASSET SUMMARY"
+          )
+
+          print(
+              "================"
+          )
+
+          for category, count in sorted(
+              categories.items()
+          ):
+
+              print(
+                  f"{category}: {count}"
+              )
+
+          print()
+          print(
+              f"Total assets: "
+              f"{len(assets)}"
+          )
+
+          PY
+
+          python3 analyze_3d.py
+
+      # ==========================================================
+      # 12. DUPLICATE DETECTION
+      # ==========================================================
+
+      - name: Detect duplicate assets
+        run: |
+
+          cat > duplicates.py <<'PY'
+
+          import json
+          from collections import defaultdict
+
+
+          with open(
+              "ASSET_MANIFEST.json"
+          ) as f:
+
+              assets = json.load(f)
+
+
+          hashes = defaultdict(list)
+
+
+          for asset in assets:
+
+              hashes[
+                  asset["sha256"]
+              ].append(
+                  asset["path"]
+              )
+
+
+          duplicates = {
+
+              sha:
+                  paths
+
+              for sha, paths
+              in hashes.items()
+
+              if len(paths) > 1
+
+          }
+
+
+          with open(
+              "DUPLICATES.json",
+              "w"
+          ) as f:
+
+              json.dump(
+                  duplicates,
+                  f,
+                  indent=2
+              )
+
+
+          print(
+              f"Duplicate groups: "
+              f"{len(duplicates)}"
+          )
+
+
+          for sha, paths in duplicates.items():
+
+              print()
+              print(
+                  f"SHA256: {sha}"
+              )
+
+              for path in paths:
+
+                  print(
+                      "  ",
+                      path
+                  )
+
+          PY
+
+          python3 duplicates.py
+
+      # ==========================================================
+      # 13. DETECT MODEL/TEXTURE RELATIONSHIPS
+      # ==========================================================
+
+      - name: Build asset relations
+        run: |
+
+          cat > relations.py <<'PY'
+
+          import json
+
+          from pathlib import Path
+
+
+          with open(
+              "ASSET_MANIFEST.json"
+          ) as f:
+
+              assets = json.load(f)
+
+
+          textures = [
+
+              Path(a["path"]).name.lower()
+
+              for a in assets
+
+              if a["type"] == "texture"
+
+          ]
+
+
+          models = [
+
+              a
+
+              for a in assets
+
+              if a["type"] == "3d_model"
+
+          ]
+
+
+          relations = []
+
+
+          for model in models:
+
+              model_name = Path(
+                  model["filename"]
+              ).stem.lower()
+
+              related = []
+
+              for texture in textures:
+
+                  texture_name = Path(
+                      texture
+                  ).stem.lower()
+
+                  if (
+
+                      model_name in texture_name
+
+                      or
+
+                      texture_name in model_name
+
+                  ):
+
+                      related.append(
+                          texture
+                      )
+
+              relations.append({
+
+                  "model":
+                      model["path"],
+
+                  "possible_textures":
+                      related
+
+              })
+
+
+          with open(
+
+              "ASSET_RELATIONS.json",
+
+              "w"
+
+          ) as f:
+
+              json.dump(
+
+                  relations,
+
+                  f,
+
+                  indent=2
+
+              )
+
+          PY
+
+          python3 relations.py
+
+      # ==========================================================
+      # 14. CREATE REPORT
+      # ==========================================================
+
+      - name: Generate 3D report
+        run: |
+
+          mkdir -p docs
+
+          python3 - <<'PY'
+
+          import json
+          from collections import Counter
+
+
+          with open(
+              "ASSET_MANIFEST.json"
+          ) as f:
+
+              assets = json.load(f)
+
+
+          counter = Counter(
+
+              a["type"]
+
+              for a in assets
+
+          )
+
+
+          total_size = sum(
+
+              a["size"]
+
+              for a in assets
+
+          )
+
+
+          with open(
+              "docs/3D_ASSET_REPORT.md",
+              "w"
+          ) as f:
+
+              f.write(
+                  "# 3D Asset Report\n\n"
+              )
+
+              f.write(
+                  "## Summary\n\n"
+              )
+
+              f.write(
+                  f"- Total assets: "
+                  f"{len(assets)}\n"
+              )
+
+              f.write(
+                  f"- Total size: "
+                  f"{total_size / 1024**3:.3f} GiB\n\n"
+              )
+
+              f.write(
+                  "## Asset Types\n\n"
+              )
+
+              for typ, count in sorted(
+                  counter.items()
+              ):
+
+                  f.write(
+                      f"- {typ}: "
+                      f"{count}\n"
+                  )
+
+              f.write(
+                  "\n## Largest Assets\n\n"
+              )
+
+              largest = sorted(
+
+                  assets,
+
+                  key=lambda x:
+                      x["size"],
+
+                  reverse=True
+
+              )
+
+              for asset in largest[:100]:
+
+                  f.write(
+
+                      f"- "
+                      f"{asset['size_mb']:.2f} MB "
+                      f"`{asset['path']}`\n"
+
+                  )
+
+          PY
+
+      # ==========================================================
+      # 15. GIT LFS
+      # ==========================================================
+
+      - name: Configure Git LFS
+        run: |
+
+          git lfs install
+
+          cat > .gitattributes <<'EOF'
+
+          # Blender
+          *.blend filter=lfs diff=lfs merge=lfs -text
+
+          # 3D models
+          *.fbx filter=lfs diff=lfs merge=lfs -text
+          *.obj filter=lfs diff=lfs merge=lfs -text
+          *.glb filter=lfs diff=lfs merge=lfs -text
+          *.gltf filter=lfs diff=lfs merge=lfs -text
+          *.dae filter=lfs diff=lfs merge=lfs -text
+          *.3ds filter=lfs diff=lfs merge=lfs -text
+          *.stl filter=lfs diff=lfs merge=lfs -text
+          *.ply filter=lfs diff=lfs merge=lfs -text
+          *.abc filter=lfs diff=lfs merge=lfs -text
+
+          # USD
+          *.usd filter=lfs diff=lfs merge=lfs -text
+          *.usda filter=lfs diff=lfs merge=lfs -text
+          *.usdc filter=lfs diff=lfs merge=lfs -text
+          *.usdz filter=lfs diff=lfs merge=lfs -text
+
+          # DCC
+          *.max filter=lfs diff=lfs merge=lfs -text
+          *.ma filter=lfs diff=lfs merge=lfs -text
+          *.mb filter=lfs diff=lfs merge=lfs -text
+          *.c4d filter=lfs diff=lfs merge=lfs -text
+
+          # Textures
+          *.psd filter=lfs diff=lfs merge=lfs -text
+          *.exr filter=lfs diff=lfs merge=lfs -text
+          *.hdr filter=lfs diff=lfs merge=lfs -text
+          *.dds filter=lfs diff=lfs merge=lfs -text
+          *.tga filter=lfs diff=lfs merge=lfs -text
+
+          EOF
+
+      # ==========================================================
+      # 16. COPY PROJECT
+      # ==========================================================
+
+      - name: Import extracted project
+        run: |
+
+          cp -a extracted/. ./
+
+      # ==========================================================
+      # 17. REMOVE ONLY ARCHIVES + TEMPORARY FILES
+      # ==========================================================
+
+      - name: Remove imported archives
+        run: |
+
+          find . \
+            -type f \
+            \( \
+              -iname "*.rar" \
+              -o -iname "*.zip" \
+              -o -iname "*.7z" \
+              -o -iname "*.tar" \
+              -o -iname "*.tar.gz" \
+              -o -iname "*.tgz" \
+              -o -iname "*.tar.bz2" \
+              -o -iname "*.tar.xz" \
+            \) \
+            -delete
+
+          find . \
+            -type f \
+            \( \
+              -name "Thumbs.db" \
+              -o -name ".DS_Store" \
+              -o -name "desktop.ini" \
+            \) \
+            -delete
+
+      # ==========================================================
+      # 18. GITIGNORE
+      # ==========================================================
+
+      - name: Create Git ignore
+        run: |
+
+          cat >> .gitignore <<'EOF'
+
+          # Telegram downloads
+          downloads/
+
+          # Partial downloads
+          *.part
+          *.checkpoint
+
+          # Extraction workspace
+          extracted/
+
+          # Python
+          __pycache__/
+          *.pyc
+
+          # OS
+          .DS_Store
+          Thumbs.db
+          desktop.ini
+
+          # Temporary
+          *.tmp
+          *.temp
+
+          EOF
+
+      # ==========================================================
+      # 19. PREPARE LFS FOR LARGE 3D FILES
+      # ==========================================================
+
+      - name: Track large 3D assets
+        run: |
+
+          find . \
+            -type f \
+            -size +50M \
+            -print0 \
+          | while IFS= read -r -d '' file; do
+
+              case "$file" in
+
+                *.blend|\
+                *.fbx|\
+                *.obj|\
+                *.glb|\
+                *.gltf|\
+                *.dae|\
+                *.3ds|\
+                *.stl|\
+                *.ply|\
+                *.abc|\
+                *.usd|\
+                *.usda|\
+                *.usdc|\
+                *.usdz|\
+                *.max|\
+                *.ma|\
+                *.mb|\
+                *.c4d|\
+                *.psd|\
+                *.exr|\
+                *.hdr|\
+                *.dds|\
+                *.tga)
+
+                  echo "LFS:"
+                  echo "$file"
+
+                  git lfs track "$file"
+
+                  ;;
+
+              esac
+
+          done
+
+      # ==========================================================
+      # 20. GENERATE IMPORT MANIFEST
+      # ==========================================================
+
+      - name: Generate import information
+        run: |
+
+          mkdir -p docs
+
+          cp ASSET_MANIFEST.json \
+            docs/ASSET_MANIFEST.json
+
+          cp ASSET_RELATIONS.json \
+            docs/ASSET_RELATIONS.json
+
+          cp DUPLICATES.json \
+            docs/DUPLICATES.json
+
+          cp extraction-log.json \
+            docs/EXTRACTION_LOG.json
+
+          cp checksums/SHA256SUMS.txt \
+            docs/SHA256SUMS.txt
+
+      # ==========================================================
+      # 21. FINAL SCAN
+      # ==========================================================
+
+      - name: Final repository scan
+        run: |
+
+          echo
+          echo "=============================="
+          echo "3D ASSET COUNT"
+          echo "=============================="
+
+          find . \
+            -type f \
+            \( \
+              -iname "*.blend" \
+              -o -iname "*.fbx" \
+              -o -iname "*.obj" \
+              -o -iname "*.glb" \
+              -o -iname "*.gltf" \
+              -o -iname "*.dae" \
+              -o -iname "*.3ds" \
+              -o -iname "*.stl" \
+              -o -iname "*.ply" \
+              -o -iname "*.usd" \
+              -o -iname "*.usda" \
+              -o -iname "*.usdc" \
+              -o -iname "*.usdz" \
+            \) \
+            | wc -l
+
+          echo
+          echo "=============================="
+          echo "LFS STATUS"
+          echo "=============================="
+
+          git lfs status || true
+
+          echo
+          echo "=============================="
+          echo "GIT STATUS"
+          echo "=============================="
+
+          git status --short
+
+      # ==========================================================
+      # 22. STAGE
+      # ==========================================================
+
+      - name: Stage files
+        run: |
+
+          git add .
+
+      # ==========================================================
+      # 23. CHECK COMMIT
+      # ==========================================================
+
+      - name: Check staged changes
+        run: |
+
+          git diff \
+            --cached \
+            --stat
+
+          echo
+
+          git diff \
+            --cached \
+            --name-status \
+            | head -1000
+
+      # ==========================================================
+      # 24. COMMIT
+      # ==========================================================
+
+      - name: Commit imported assets
+        run: |
+
+          if git diff \
+            --cached \
+            --quiet; then
+
+            echo "Nothing to commit."
+
+          else
+
+            git commit \
+              -m "Import iCity 3D assets"
+
+          fi
+
+      # ==========================================================
+      # 25. PUSH
+      # ==========================================================
+
+      - name: Push to GitHub
+        run: |
+
+          git push origin HEAD:main
