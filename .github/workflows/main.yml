@@ -1,4 +1,4 @@
-name: Telegram 3D Asset Importer
+name: Telegram 3D Smart Import
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         default: "3875"
 
       prefix:
-        description: "Archive filename prefix"
+        description: "Archive group prefix"
         required: true
         default: "iCity Cyberpunk"
 
@@ -23,6 +23,12 @@ on:
         required: true
         default: "10"
 
+      force_download:
+        description: "Ignore existing cache and download again"
+        required: true
+        type: boolean
+        default: false
+
 permissions:
   contents: write
 
@@ -30,105 +36,61 @@ concurrency:
   group: telegram-3d-import
   cancel-in-progress: false
 
+env:
+  CHANNEL: ${{ inputs.channel }}
+  MESSAGE_ID: ${{ inputs.message_id }}
+  ARCHIVE_PREFIX: ${{ inputs.prefix }}
+  MAX_ARCHIVE_DEPTH: ${{ inputs.max_depth }}
+
 jobs:
 
-  import-3d-assets:
+  # ============================================================
+  # JOB 1 — DISCOVERY
+  # ============================================================
+
+  discover:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 360
-
-    env:
-      CHANNEL: ${{ inputs.channel }}
-      MESSAGE_ID: ${{ inputs.message_id }}
-      ARCHIVE_PREFIX: ${{ inputs.prefix }}
-      MAX_ARCHIVE_DEPTH: ${{ inputs.max_depth }}
+    outputs:
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
 
     steps:
 
-      # ==========================================================
-      # 1. CHECKOUT
-      # ==========================================================
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          lfs: true
 
-      # ==========================================================
-      # 2. SYSTEM INFORMATION
-      # ==========================================================
-
-      - name: System information
+      - name: Install Python
         run: |
-          echo "CPU:"
-          nproc
-
-          echo
-          echo "Memory:"
-          free -h
-
-          echo
-          echo "Disk:"
-          df -h
-
-      # ==========================================================
-      # 3. INSTALL TOOLS
-      # ==========================================================
-
-      - name: Install archive tools
-        run: |
-
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            p7zip-full \
-            p7zip-rar \
-            unrar \
-            unzip \
-            jq \
-            file \
-            tree
-
           python3 -m pip install --upgrade pip
-
-          python3 -m pip install \
-            telethon
-
-      # ==========================================================
-      # 4. RESTORE TELEGRAM SESSION
-      # ==========================================================
+          python3 -m pip install telethon
 
       - name: Restore Telegram session
         env:
           TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
-
         run: |
 
-          if [ -z "$TELEGRAM_SESSION_B64" ]; then
-            echo "::error::TELEGRAM_SESSION_B64 is missing"
-            exit 1
-          fi
+          test -n "$TELEGRAM_SESSION_B64"
+
+          mkdir -p secrets
 
           printf '%s' "$TELEGRAM_SESSION_B64" \
             | base64 -d \
-            > telegram_session.session
+            > secrets/telegram_session.session
 
-          chmod 600 telegram_session.session
+          chmod 600 secrets/telegram_session.session
 
-          ls -lh telegram_session.session
+      - name: Discover archive volumes
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
 
-      # ==========================================================
-      # 5. DISCOVER TELEGRAM ARCHIVES
-      # ==========================================================
-
-      - name: Create Telegram discovery script
         run: |
 
-          cat > telegram_discover.py <<'PY'
+          cat > discover.py <<'PY'
 
           import os
+          import re
           import json
           import asyncio
 
@@ -143,9 +105,7 @@ jobs:
               "TELEGRAM_API_HASH"
           ]
 
-          CHANNEL = os.environ[
-              "CHANNEL"
-          ]
+          CHANNEL = os.environ["CHANNEL"]
 
           MESSAGE_ID = int(
               os.environ["MESSAGE_ID"]
@@ -156,61 +116,95 @@ jobs:
           ]
 
 
-          ARCHIVE_EXTENSIONS = (
+          def normalize(name):
 
-              ".rar",
-              ".zip",
-              ".7z",
+              name = name.lower()
 
-              ".tar",
-              ".tar.gz",
-              ".tgz",
+              name = re.sub(
+                  r'\.part\d+\.rar$',
+                  '',
+                  name,
+                  flags=re.I
+              )
 
-              ".tar.bz2",
-              ".tbz2",
+              name = re.sub(
+                  r'\.r\d+$',
+                  '',
+                  name,
+                  flags=re.I
+              )
 
-              ".tar.xz",
-              ".txz",
+              name = re.sub(
+                  r'\.\d{3}$',
+                  '',
+                  name,
+                  flags=re.I
+              )
 
-          )
+              return name
+
+
+          def volume_number(name):
+
+              m = re.search(
+                  r'\.part(\d+)\.rar$',
+                  name,
+                  re.I
+              )
+
+              if m:
+                  return int(m.group(1))
+
+              m = re.search(
+                  r'\.r(\d+)$',
+                  name,
+                  re.I
+              )
+
+              if m:
+                  return int(m.group(1))
+
+              m = re.search(
+                  r'\.(\d{3})$',
+                  name,
+                  re.I
+              )
+
+              if m:
+                  return int(m.group(1))
+
+              return 1
 
 
           async def main():
 
               client = TelegramClient(
-                  "telegram_session",
+                  "secrets/telegram_session",
                   API_ID,
                   API_HASH
               )
 
               await client.start()
 
-              print(
-                  f"Searching {CHANNEL}"
-              )
-
-              print(
-                  f"Around message {MESSAGE_ID}"
-              )
-
-              start_id = max(
-                  1,
-                  MESSAGE_ID - 1500
-              )
-
-              end_id = (
-                  MESSAGE_ID + 1500
-              )
-
               found = {}
+
+              # Search a wider area so multipart volumes
+              # posted in nearby messages are discovered.
+
+              start = max(
+                  1,
+                  MESSAGE_ID - 3000
+              )
+
+              end = MESSAGE_ID + 3000
 
               async for message in client.iter_messages(
 
                   CHANNEL,
 
-                  min_id=start_id,
+                  min_id=start,
 
-                  max_id=end_id
+                  max_id=end
 
               ):
 
@@ -222,29 +216,38 @@ jobs:
                       or ""
                   )
 
-                  lower = name.lower()
-
-                  if PREFIX:
-
-                      if not name.startswith(
-                          PREFIX
-                      ):
-                          continue
-
-                  if not any(
-
-                      lower.endswith(ext)
-
-                      for ext
-                      in ARCHIVE_EXTENSIONS
-
-                  ):
-
+                  if not name:
                       continue
 
-                  found[
-                      message.id
-                  ] = {
+                  lower = name.lower()
+
+                  archive = (
+
+                      lower.endswith(".rar")
+                      or
+                      lower.endswith(".zip")
+                      or
+                      lower.endswith(".7z")
+                      or
+                      lower.endswith(".tar")
+                      or
+                      lower.endswith(".tar.gz")
+                      or
+                      lower.endswith(".tgz")
+                      or
+                      lower.endswith(".tar.bz2")
+                      or
+                      lower.endswith(".tar.xz")
+
+                  )
+
+                  if not archive:
+                      continue
+
+                  if PREFIX.lower() not in lower:
+                      continue
+
+                  found[message.id] = {
 
                       "message_id":
                           message.id,
@@ -253,94 +256,301 @@ jobs:
                           name,
 
                       "size":
-                          message.file.size,
+                          int(message.file.size),
 
-                      "size_gib":
-                          round(
-                              message.file.size
-                              / (1024 ** 3),
-                              4
-                          )
+                      "volume":
+                          volume_number(name),
+
+                      "base":
+                          normalize(name)
 
                   }
 
               await client.disconnect()
 
-              results = list(
+              if not found:
+
+                  raise RuntimeError(
+                      "No matching Telegram files found."
+                  )
+
+              volumes = list(
                   found.values()
               )
 
-              results.sort(
-                  key=lambda x:
+              volumes.sort(
+                  key=lambda x: (
+                      x["base"],
+                      x["volume"],
                       x["message_id"]
+                  )
               )
 
-              if not results:
+              # Group by archive base name.
+
+              groups = {}
+
+              for item in volumes:
+
+                  groups.setdefault(
+                      item["base"],
+                      []
+                  ).append(item)
+
+              # Select group matching requested prefix.
+
+              selected = []
+
+              for base, items in groups.items():
+
+                  if PREFIX.lower() in base:
+
+                      selected.extend(items)
+
+              if not selected:
 
                   raise RuntimeError(
-                      "No archives found."
+                      "No matching archive group."
                   )
 
-              print()
-              print(
-                  "=============================="
-              )
-
-              print(
-                  "ARCHIVES FOUND"
-              )
-
-              print(
-                  "=============================="
-              )
-
-              for item in results:
-
-                  print(
-                      f"{item['message_id']} "
-                      f"{item['name']} "
-                      f"{item['size_gib']} GiB"
+              selected.sort(
+                  key=lambda x: (
+                      x["volume"],
+                      x["message_id"]
                   )
+              )
+
+              # Remove duplicate Telegram messages
+              # representing the same volume.
+
+              unique = {}
+
+              for item in selected:
+
+                  key = (
+                      item["base"],
+                      item["volume"]
+                  )
+
+                  if key not in unique:
+
+                      unique[key] = item
+
+                  else:
+
+                      # Prefer the larger file if duplicate
+                      # metadata appears.
+
+                      old = unique[key]
+
+                      if item["size"] > old["size"]:
+
+                          unique[key] = item
+
+              selected = list(
+                  unique.values()
+              )
+
+              selected.sort(
+                  key=lambda x: x["volume"]
+              )
+
+              # Check volume sequence.
+
+              volumes = [
+                  x["volume"]
+                  for x in selected
+              ]
+
+              print(
+                  "Detected volumes:",
+                  volumes
+              )
+
+              if len(volumes) > 1:
+
+                  expected = list(
+                      range(
+                          min(volumes),
+                          max(volumes) + 1
+                      )
+                  )
+
+                  missing = [
+                      x
+                      for x in expected
+                      if x not in volumes
+                  ]
+
+                  if missing:
+
+                      raise RuntimeError(
+
+                          "Missing archive volumes: "
+                          +
+                          ", ".join(
+                              str(x)
+                              for x in missing
+                          )
+
+                      )
 
               with open(
-                  "telegram_archives.json",
+                  "archives.json",
                   "w"
               ) as f:
 
                   json.dump(
-                      results,
+                      selected,
                       f,
+                      indent=2,
+                      sort_keys=True
+                  )
+
+              print(
+                  json.dumps(
+                      selected,
                       indent=2
                   )
+              )
 
 
           asyncio.run(main())
 
           PY
 
-      - name: Discover Telegram archives
+          python3 discover.py
+
+      - name: Generate immutable archive fingerprint
+        id: fingerprint
+        run: |
+
+          python3 - <<'PY'
+
+          import hashlib
+          import json
+
+          with open("archives.json", "rb") as f:
+              data = f.read()
+
+          digest = hashlib.sha256(
+              data
+          ).hexdigest()
+
+          print(
+              "fingerprint=" + digest
+          )
+
+          with open(
+              "fingerprint.txt",
+              "w"
+          ) as f:
+
+              f.write(digest)
+
+          PY
+
+          echo "fingerprint=$(cat fingerprint.txt)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Upload discovery metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-discovery
+          path: |
+            archives.json
+            fingerprint.txt
+          retention-days: 7
+
+
+  # ============================================================
+  # JOB 2 — DOWNLOAD
+  # ============================================================
+
+  download:
+
+    needs: discover
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      cache_key: ${{ steps.cache_key.outputs.key }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download discovery metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: telegram-discovery
+
+      - name: Generate cache key
+        id: cache_key
+        run: |
+
+          KEY="telegram-3d-${CHANNEL}-${{ needs.discover.outputs.fingerprint }}"
+
+          echo "key=$KEY" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "$KEY"
+
+      # --------------------------------------------------------
+      # IMPORTANT:
+      # The archive is cached using the Telegram metadata
+      # fingerprint.
+      #
+      # Same files => same cache key => no new Telegram download.
+      # --------------------------------------------------------
+
+      - name: Restore archive cache
+        id: archive-cache
+        uses: actions/cache@v4
+        with:
+          path: telegram_cache
+          key: ${{ steps.cache_key.outputs.key }}
+
+      - name: Install Telethon
+        if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
+        run: |
+
+          python3 -m pip install --upgrade pip
+          python3 -m pip install telethon
+
+      - name: Restore Telegram session
+        if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
+        env:
+          TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
+        run: |
+
+          mkdir -p secrets
+
+          printf '%s' "$TELEGRAM_SESSION_B64" \
+            | base64 -d \
+            > secrets/telegram_session.session
+
+          chmod 600 secrets/telegram_session.session
+
+      - name: Download multipart archives
+        if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
 
         run: |
 
-          python3 telegram_discover.py
+          mkdir -p telegram_cache
+          mkdir -p telegram_partial
 
-          cat telegram_archives.json
-
-      # ==========================================================
-      # 6. DOWNLOAD ENGINE
-      # ==========================================================
-
-      - name: Create resilient Telegram downloader
-        run: |
-
-          cat > telegram_download.py <<'PY'
+          cat > download.py <<'PY'
 
           import os
           import json
           import asyncio
+
+          from pathlib import Path
 
           from telethon import TelegramClient
 
@@ -357,72 +567,65 @@ jobs:
               "CHANNEL"
           ]
 
+          CHUNK_SIZE = 8 * 1024 * 1024
 
-          CHUNK_SIZE = (
-              8 * 1024 * 1024
-          )
-
-          MAX_RETRIES = 10
+          MAX_RETRIES = 12
 
 
-          async def download_message(
-
+          async def download_one(
               client,
-              message,
-              destination
-
+              item
           ):
 
-              expected = (
-                  message.file.size
+              name = item["name"]
+
+              expected = int(
+                  item["size"]
+              )
+
+              final = (
+                  Path("telegram_cache")
+                  / name
               )
 
               partial = (
-                  destination
-                  + ".part"
+                  Path("telegram_partial")
+                  / (name + ".part")
               )
 
-              checkpoint = (
-                  destination
-                  + ".checkpoint"
-              )
+              if final.exists():
 
-              if os.path.exists(
-                  partial
-              ):
-
-                  current = os.path.getsize(
-                      partial
-                  )
-
-                  if current > expected:
+                  if (
+                      final.stat().st_size
+                      == expected
+                  ):
 
                       print(
-                          "Invalid partial file."
+                          "Already complete:",
+                          name
                       )
 
-                      os.remove(
-                          partial
-                      )
+                      return
+
+                  print(
+                      "Invalid cached file:",
+                      name
+                  )
+
+                  final.unlink()
 
               for attempt in range(
-
                   1,
                   MAX_RETRIES + 1
-
               ):
 
                   try:
 
                       current = (
 
-                          os.path.getsize(
-                              partial
-                          )
+                          partial.stat().st_size
 
-                          if os.path.exists(
-                              partial
-                          )
+                          if partial.exists()
 
                           else 0
 
@@ -430,16 +633,37 @@ jobs:
 
                       print()
                       print(
-                          f"Downloading "
-                          f"{message.file.name}"
+                          "================================"
                       )
 
                       print(
-                          f"Resume: "
-                          f"{current / 1024**3:.3f} "
-                          f"/ "
-                          f"{expected / 1024**3:.3f} GiB"
+                          f"Downloading: {name}"
                       )
+
+                      print(
+                          f"Attempt: "
+                          f"{attempt}/{MAX_RETRIES}"
+                      )
+
+                      print(
+                          f"Resume at: "
+                          f"{current / 1024**3:.3f} GiB"
+                      )
+
+                      message = (
+                          await client.get_messages(
+                              CHANNEL,
+                              ids=item[
+                                  "message_id"
+                              ]
+                          )
+                      )
+
+                      if not message:
+
+                          raise RuntimeError(
+                              "Telegram message disappeared."
+                          )
 
                       with open(
                           partial,
@@ -460,62 +684,24 @@ jobs:
 
                               f.flush()
 
-                              os.fsync(
-                                  f.fileno()
-                              )
+                              current += len(chunk)
 
-                              current += len(
-                                  chunk
-                              )
+                              if current % (
+                                  256 * 1024 * 1024
+                              ) < CHUNK_SIZE:
 
-                              with open(
-                                  checkpoint,
-                                  "w"
-                              ) as cp:
+                                  print(
 
-                                  json.dump(
-
-                                      {
-
-                                          "file":
-                                              message.file.name,
-
-                                          "expected":
-                                              expected,
-
-                                          "downloaded":
-                                              current,
-
-                                          "status":
-                                              "downloading"
-
-                                      },
-
-                                      cp
+                                      f"{current / 1024**3:.3f}"
+                                      f" / "
+                                      f"{expected / 1024**3:.3f}"
+                                      f" GiB"
 
                                   )
 
-                              print(
-
-                                  f"\r"
-                                  f"{current / 1024**3:.3f}"
-                                  f" / "
-                                  f"{expected / 1024**3:.3f}"
-                                  f" GiB",
-
-                                  end="",
-
-                                  flush=True
-
-                              )
-
                       final_size = (
-                          os.path.getsize(
-                              partial
-                          )
+                          partial.stat().st_size
                       )
-
-                      print()
 
                       if final_size != expected:
 
@@ -529,71 +715,39 @@ jobs:
 
                       os.replace(
                           partial,
-                          destination
+                          final
                       )
 
-                      with open(
-                          checkpoint,
-                          "w"
-                      ) as cp:
-
-                          json.dump(
-
-                              {
-
-                                  "file":
-                                      message.file.name,
-
-                                  "expected":
-                                      expected,
-
-                                  "downloaded":
-                                      expected,
-
-                                  "status":
-                                      "completed"
-
-                              },
-
-                              cp
-
-                          )
-
                       print(
-                          "DOWNLOAD COMPLETE"
+                          "COMPLETE:",
+                          name
                       )
 
                       return
 
-                  except Exception as error:
-
-                      print()
+                  except Exception as exc:
 
                       print(
-                          f"Attempt "
-                          f"{attempt}/"
-                          f"{MAX_RETRIES} failed:"
-                      )
-
-                      print(
-                          repr(error)
+                          "DOWNLOAD ERROR:",
+                          repr(exc)
                       )
 
                       if attempt >= MAX_RETRIES:
 
                           raise
 
-                      wait = min(
-                          180,
-                          attempt * 15
+                      delay = min(
+                          300,
+                          15 * attempt
                       )
 
                       print(
-                          f"Waiting {wait}s..."
+                          f"Retrying in "
+                          f"{delay}s..."
                       )
 
                       await asyncio.sleep(
-                          wait
+                          delay
                       )
 
 
@@ -601,7 +755,7 @@ jobs:
 
               client = TelegramClient(
 
-                  "telegram_session",
+                  "secrets/telegram_session",
 
                   API_ID,
 
@@ -611,73 +765,17 @@ jobs:
 
               await client.start()
 
-              os.makedirs(
-                  "downloads",
-                  exist_ok=True
-              )
-
               with open(
-                  "telegram_archives.json"
+                  "archives.json"
               ) as f:
 
                   archives = json.load(f)
 
               for item in archives:
 
-                  message = (
-                      await client.get_messages(
-
-                          CHANNEL,
-
-                          ids=item[
-                              "message_id"
-                          ]
-
-                      )
-                  )
-
-                  if not message:
-
-                      raise RuntimeError(
-
-                          f"Message "
-                          f"{item['message_id']} "
-                          f"not found."
-
-                      )
-
-                  path = os.path.join(
-
-                      "downloads",
-
-                      item["name"]
-
-                  )
-
-                  if os.path.exists(path):
-
-                      if (
-
-                          os.path.getsize(path)
-                          == item["size"]
-
-                      ):
-
-                          print(
-                              f"Already downloaded: "
-                              f"{item['name']}"
-                          )
-
-                          continue
-
-                  await download_message(
-
+                  await download_one(
                       client,
-
-                      message,
-
-                      path
-
+                      item
                   )
 
               await client.disconnect()
@@ -687,146 +785,239 @@ jobs:
 
           PY
 
-      - name: Download Telegram archives
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          python3 download.py
 
+      - name: Validate downloaded volumes
         run: |
-
-          python3 telegram_download.py
-
-      # ==========================================================
-      # 7. SHA256 VERIFICATION
-      # ==========================================================
-
-      - name: Verify downloaded files
-        run: |
-
-          mkdir -p checksums
-
-          for file in downloads/*; do
-
-            [ -f "$file" ] || continue
-
-            sha256sum "$file" \
-              >> checksums/SHA256SUMS.txt
-
-          done
-
-          cat checksums/SHA256SUMS.txt
 
           python3 - <<'PY'
 
-          import os
           import json
+          from pathlib import Path
 
           with open(
-              "telegram_archives.json"
+              "archives.json"
           ) as f:
 
               archives = json.load(f)
 
+          root = Path(
+              "telegram_cache"
+          )
+
           for item in archives:
 
-              path = os.path.join(
+              path = root / item["name"]
 
-                  "downloads",
-
-                  item["name"]
-
-              )
-
-              if not os.path.isfile(path):
+              if not path.exists():
 
                   raise RuntimeError(
                       f"Missing: {path}"
                   )
 
-              actual = os.path.getsize(
-                  path
-              )
+              actual = path.stat().st_size
 
-              expected = item[
-                  "size"
-              ]
+              expected = int(
+                  item["size"]
+              )
 
               if actual != expected:
 
                   raise RuntimeError(
 
-                      f"Size mismatch: "
-                      f"{item['name']}"
+                      f"Size mismatch for "
+                      f"{path}: "
+                      f"{actual} != "
+                      f"{expected}"
 
                   )
 
               print(
-                  f"OK: {item['name']}"
+                  "OK:",
+                  path
               )
 
           PY
 
-      # ==========================================================
-      # 8. TEST ARCHIVES
-      # ==========================================================
+      # The cache is saved automatically by actions/cache
+      # when this job completes successfully.
 
-      - name: Test archives
+
+  # ============================================================
+  # JOB 3 — VERIFY + EXTRACT
+  # ============================================================
+
+  extract:
+
+    needs:
+      - discover
+      - download
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download discovery
+        uses: actions/download-artifact@v4
+        with:
+          name: telegram-discovery
+
+      - name: Restore downloaded Telegram archive
+        uses: actions/cache@v4
+        with:
+          path: telegram_cache
+          key: telegram-3d-${{ env.CHANNEL }}-${{ needs.discover.outputs.fingerprint }}
+          fail-on-cache-miss: true
+
+      - name: Install archive tools
         run: |
 
-          for archive in downloads/*; do
+          sudo apt-get update
 
-            [ -f "$archive" ] || continue
+          sudo apt-get install -y \
+            p7zip-full \
+            p7zip-rar \
+            unrar \
+            unzip \
+            jq \
+            file \
+            tree
 
-            echo
-            echo "Testing:"
-            echo "$archive"
-
-            7z t "$archive" -y
-
-          done
-
-      # ==========================================================
-      # 9. EXTRACT FIRST LEVEL
-      # ==========================================================
-
-      - name: Extract root archives
+      - name: Test real archives only
         run: |
+
+          set -e
+
+          python3 - <<'PY'
+
+          import json
+          import subprocess
+          from pathlib import Path
+
+          with open(
+              "archives.json"
+          ) as f:
+
+              archives = json.load(f)
+
+          root = Path(
+              "telegram_cache"
+          )
+
+          for item in archives:
+
+              archive = (
+                  root /
+                  item["name"]
+              )
+
+              print()
+              print(
+                  "=" * 70
+              )
+
+              print(
+                  "Testing:",
+                  archive
+              )
+
+              print(
+                  "=" * 70
+              )
+
+              subprocess.run(
+                  [
+                      "7z",
+                      "t",
+                      str(archive),
+                      "-y"
+                  ],
+                  check=True
+              )
+
+          PY
+
+      - name: Detect multipart archive
+        run: |
+
+          python3 - <<'PY'
+
+          import json
+
+          with open(
+              "archives.json"
+          ) as f:
+
+              archives = json.load(f)
+
+          print(
+              "Archive volumes:"
+          )
+
+          for item in archives:
+
+              print(
+                  f"  part {item['volume']}: "
+                  f"{item['name']}"
+              )
+
+          if len(archives) > 1:
+
+              print()
+              print(
+                  "MULTIVOLUME ARCHIVE DETECTED"
+              )
+
+              print(
+                  "All volumes are present."
+              )
+
+          PY
+
+      - name: Extract root archive
+        run: |
+
+          set -e
 
           mkdir -p extracted
 
-          for archive in downloads/*; do
+          FIRST="$(
+            python3 - <<'PY'
+          import json
 
-            [ -f "$archive" ] || continue
+          with open("archives.json") as f:
+              data = json.load(f)
 
-            filename="$(
-              basename "$archive"
-            )"
+          data.sort(
+              key=lambda x: x["volume"]
+          )
 
-            destination="extracted/${filename}_root"
+          print(
+              data[0]["name"]
+          )
+          PY
+          )"
 
-            mkdir -p "$destination"
+          echo "Primary volume:"
+          echo "$FIRST"
 
-            echo
-            echo "Extracting:"
-            echo "$archive"
+          7z x \
+            "telegram_cache/$FIRST" \
+            "-oextracted" \
+            -y \
+            -aoa
 
-            7z x \
+      # ========================================================
+      # NESTED ARCHIVE EXTRACTION
+      # ========================================================
 
-              "$archive" \
+      - name: Recursive extraction up to 10 levels
+        env:
+          MAX_ARCHIVE_DEPTH: ${{ env.MAX_ARCHIVE_DEPTH }}
 
-              "-o$destination" \
-
-              -y \
-
-              -aoa
-
-          done
-
-      # ==========================================================
-      # 10. NESTED ARCHIVE ENGINE — 10 LEVELS
-      # ==========================================================
-
-      - name: Recursive extraction
         run: |
 
           cat > recursive_extract.py <<'PY'
@@ -842,17 +1033,11 @@ jobs:
               "extracted"
           ).resolve()
 
-
           MAX_DEPTH = int(
-
               os.environ.get(
-
                   "MAX_ARCHIVE_DEPTH",
-
                   "10"
-
               )
-
           )
 
 
@@ -875,34 +1060,19 @@ jobs:
           )
 
 
-          processed = set()
-
-          extraction_log = []
-
-
           def is_archive(path):
 
-              name = (
-                  path.name.lower()
-              )
+              name = path.name.lower()
 
               return any(
-
-                  name.endswith(ext)
-
-                  for ext
-                  in EXTENSIONS
-
+                  name.endswith(x)
+                  for x in EXTENSIONS
               )
 
 
           def safe_path(path):
 
-              resolved = (
-                  path.resolve()
-              )
-
-              root = str(ROOT)
+              resolved = path.resolve()
 
               return (
 
@@ -911,20 +1081,23 @@ jobs:
                   or
 
                   str(resolved).startswith(
-                      root + os.sep
+                      str(ROOT) + os.sep
                   )
 
               )
 
 
-          for depth in range(
+          processed = set()
 
+          log = []
+
+
+          for depth in range(
               1,
               MAX_DEPTH + 1
-
           ):
 
-              archives = []
+              candidates = []
 
               for path in ROOT.rglob("*"):
 
@@ -934,99 +1107,78 @@ jobs:
                   if not is_archive(path):
                       continue
 
-                  resolved = str(
+                  key = str(
                       path.resolve()
                   )
 
-                  if resolved in processed:
+                  if key in processed:
                       continue
 
                   if not safe_path(path):
 
                       raise RuntimeError(
-
-                          "Unsafe path: "
-                          + str(path)
-
+                          f"Unsafe archive path: "
+                          f"{path}"
                       )
 
-                  archives.append(path)
+                  candidates.append(path)
 
-              if not archives:
+              if not candidates:
 
                   print(
-                      f"No more archives "
-                      f"at depth {depth}."
+                      "No more nested archives."
                   )
 
                   break
 
               print()
               print(
-                  f"ARCHIVE DEPTH {depth}"
+                  f"========== DEPTH {depth} =========="
               )
 
-              for archive in archives:
+              for archive in candidates:
 
-                  resolved = str(
+                  key = str(
                       archive.resolve()
                   )
 
-                  processed.add(
-                      resolved
-                  )
+                  processed.add(key)
 
                   destination = (
-
                       archive.parent
                       /
                       (
-                          archive.stem
-                          +
-                          "_extracted"
+                          archive.name
+                          + ".extracted"
                       )
-
                   )
 
                   destination.mkdir(
-
                       parents=True,
-
                       exist_ok=True
-
                   )
 
                   print(
-                      "Extracting:"
-                  )
-
-                  print(
+                      "Extracting:",
                       archive
                   )
 
                   subprocess.run(
 
                       [
-
                           "7z",
-
                           "x",
-
                           str(archive),
-
                           f"-o{destination}",
-
                           "-y",
-
                           "-aoa"
-
                       ],
 
                       check=True
 
                   )
 
-                  extraction_log.append({
+                  log.append({
 
                       "depth":
                           depth,
@@ -1041,879 +1193,43 @@ jobs:
 
 
           with open(
-
               "extraction-log.json",
-
               "w"
-
           ) as f:
 
               json.dump(
-
-                  extraction_log,
-
+                  log,
                   f,
-
                   indent=2
-
               )
-
-          print()
-          print(
-              "Extraction finished."
-          )
-
-          print(
-              f"Maximum depth: "
-              f"{MAX_DEPTH}"
-          )
 
           PY
 
           python3 recursive_extract.py
 
-      # ==========================================================
-      # 11. DETECT 3D ASSETS
-      # ==========================================================
 
-      - name: Detect 3D assets
-        run: |
+  # ============================================================
+  # JOB 4 — ANALYSIS
+  # ============================================================
 
-          cat > analyze_3d.py <<'PY'
+  analyze:
 
-          import os
-          import json
-          import hashlib
+    needs:
+      - discover
+      - extract
 
-          from pathlib import Path
+    runs-on: ubuntu-latest
 
+    steps:
 
-          ROOT = Path(
-              "extracted"
-          )
+      - name: Checkout
+        uses: actions/checkout@v4
 
-
-          FORMATS = {
-
-              "3d_model": {
-
-                  ".blend",
-                  ".fbx",
-                  ".obj",
-                  ".glb",
-                  ".gltf",
-                  ".dae",
-                  ".3ds",
-                  ".stl",
-                  ".ply",
-                  ".abc",
-
-                  ".usd",
-                  ".usda",
-                  ".usdc",
-                  ".usdz",
-
-                  ".max",
-                  ".ma",
-                  ".mb",
-                  ".c4d"
-
-              },
-
-              "texture": {
-
-                  ".png",
-                  ".jpg",
-                  ".jpeg",
-                  ".webp",
-                  ".tga",
-                  ".bmp",
-                  ".tif",
-                  ".tiff",
-                  ".exr",
-                  ".hdr",
-                  ".dds"
-
-              },
-
-              "material": {
-
-                  ".mtl",
-                  ".sbs",
-                  ".sbsar"
-
-              },
-
-              "animation": {
-
-                  ".bvh",
-                  ".abc"
-
-              },
-
-              "shader": {
-
-                  ".osl",
-                  ".hlsl",
-                  ".glsl"
-
-              },
-
-              "scene": {
-
-                  ".unity",
-                  ".umap"
-
-              },
-
-              "document": {
-
-                  ".psd",
-                  ".pdf",
-                  ".txt",
-                  ".json",
-                  ".xml"
-
-              }
-
-          }
-
-
-          EXTENSION_TYPE = {}
-
-          for category, extensions in FORMATS.items():
-
-              for extension in extensions:
-
-                  EXTENSION_TYPE[
-                      extension
-                  ] = category
-
-
-          def sha256(path):
-
-              h = hashlib.sha256()
-
-              with open(
-                  path,
-                  "rb"
-              ) as f:
-
-                  while True:
-
-                      data = f.read(
-                          8 * 1024 * 1024
-                      )
-
-                      if not data:
-                          break
-
-                      h.update(data)
-
-              return h.hexdigest()
-
-
-          assets = []
-
-          for path in ROOT.rglob("*"):
-
-              if not path.is_file():
-                  continue
-
-              extension = (
-                  path.suffix.lower()
-              )
-
-              category = (
-                  EXTENSION_TYPE.get(
-                      extension
-                  )
-              )
-
-              if not category:
-                  continue
-
-              size = path.stat().st_size
-
-              assets.append({
-
-                  "path":
-                      str(path),
-
-                  "filename":
-                      path.name,
-
-                  "extension":
-                      extension,
-
-                  "type":
-                      category,
-
-                  "size":
-                      size,
-
-                  "size_mb":
-                      round(
-                          size / 1024**2,
-                          3
-                      ),
-
-                  "sha256":
-                      sha256(path)
-
-              })
-
-
-          assets.sort(
-              key=lambda x:
-                  x["path"]
-          )
-
-
-          with open(
-
-              "ASSET_MANIFEST.json",
-
-              "w"
-
-          ) as f:
-
-              json.dump(
-
-                  assets,
-
-                  f,
-
-                  indent=2
-
-              )
-
-
-          categories = {}
-
-          for asset in assets:
-
-              categories.setdefault(
-
-                  asset["type"],
-
-                  0
-
-              )
-
-              categories[
-                  asset["type"]
-              ] += 1
-
-
-          print()
-          print(
-              "3D ASSET SUMMARY"
-          )
-
-          print(
-              "================"
-          )
-
-          for category, count in sorted(
-              categories.items()
-          ):
-
-              print(
-                  f"{category}: {count}"
-              )
-
-          print()
-          print(
-              f"Total assets: "
-              f"{len(assets)}"
-          )
-
-          PY
-
-          python3 analyze_3d.py
-
-      # ==========================================================
-      # 12. DUPLICATE DETECTION
-      # ==========================================================
-
-      - name: Detect duplicate assets
-        run: |
-
-          cat > duplicates.py <<'PY'
-
-          import json
-          from collections import defaultdict
-
-
-          with open(
-              "ASSET_MANIFEST.json"
-          ) as f:
-
-              assets = json.load(f)
-
-
-          hashes = defaultdict(list)
-
-
-          for asset in assets:
-
-              hashes[
-                  asset["sha256"]
-              ].append(
-                  asset["path"]
-              )
-
-
-          duplicates = {
-
-              sha:
-                  paths
-
-              for sha, paths
-              in hashes.items()
-
-              if len(paths) > 1
-
-          }
-
-
-          with open(
-              "DUPLICATES.json",
-              "w"
-          ) as f:
-
-              json.dump(
-                  duplicates,
-                  f,
-                  indent=2
-              )
-
-
-          print(
-              f"Duplicate groups: "
-              f"{len(duplicates)}"
-          )
-
-
-          for sha, paths in duplicates.items():
-
-              print()
-              print(
-                  f"SHA256: {sha}"
-              )
-
-              for path in paths:
-
-                  print(
-                      "  ",
-                      path
-                  )
-
-          PY
-
-          python3 duplicates.py
-
-      # ==========================================================
-      # 13. DETECT MODEL/TEXTURE RELATIONSHIPS
-      # ==========================================================
-
-      - name: Build asset relations
-        run: |
-
-          cat > relations.py <<'PY'
-
-          import json
-
-          from pathlib import Path
-
-
-          with open(
-              "ASSET_MANIFEST.json"
-          ) as f:
-
-              assets = json.load(f)
-
-
-          textures = [
-
-              Path(a["path"]).name.lower()
-
-              for a in assets
-
-              if a["type"] == "texture"
-
-          ]
-
-
-          models = [
-
-              a
-
-              for a in assets
-
-              if a["type"] == "3d_model"
-
-          ]
-
-
-          relations = []
-
-
-          for model in models:
-
-              model_name = Path(
-                  model["filename"]
-              ).stem.lower()
-
-              related = []
-
-              for texture in textures:
-
-                  texture_name = Path(
-                      texture
-                  ).stem.lower()
-
-                  if (
-
-                      model_name in texture_name
-
-                      or
-
-                      texture_name in model_name
-
-                  ):
-
-                      related.append(
-                          texture
-                      )
-
-              relations.append({
-
-                  "model":
-                      model["path"],
-
-                  "possible_textures":
-                      related
-
-              })
-
-
-          with open(
-
-              "ASSET_RELATIONS.json",
-
-              "w"
-
-          ) as f:
-
-              json.dump(
-
-                  relations,
-
-                  f,
-
-                  indent=2
-
-              )
-
-          PY
-
-          python3 relations.py
-
-      # ==========================================================
-      # 14. CREATE REPORT
-      # ==========================================================
-
-      - name: Generate 3D report
-        run: |
-
-          mkdir -p docs
-
-          python3 - <<'PY'
-
-          import json
-          from collections import Counter
-
-
-          with open(
-              "ASSET_MANIFEST.json"
-          ) as f:
-
-              assets = json.load(f)
-
-
-          counter = Counter(
-
-              a["type"]
-
-              for a in assets
-
-          )
-
-
-          total_size = sum(
-
-              a["size"]
-
-              for a in assets
-
-          )
-
-
-          with open(
-              "docs/3D_ASSET_REPORT.md",
-              "w"
-          ) as f:
-
-              f.write(
-                  "# 3D Asset Report\n\n"
-              )
-
-              f.write(
-                  "## Summary\n\n"
-              )
-
-              f.write(
-                  f"- Total assets: "
-                  f"{len(assets)}\n"
-              )
-
-              f.write(
-                  f"- Total size: "
-                  f"{total_size / 1024**3:.3f} GiB\n\n"
-              )
-
-              f.write(
-                  "## Asset Types\n\n"
-              )
-
-              for typ, count in sorted(
-                  counter.items()
-              ):
-
-                  f.write(
-                      f"- {typ}: "
-                      f"{count}\n"
-                  )
-
-              f.write(
-                  "\n## Largest Assets\n\n"
-              )
-
-              largest = sorted(
-
-                  assets,
-
-                  key=lambda x:
-                      x["size"],
-
-                  reverse=True
-
-              )
-
-              for asset in largest[:100]:
-
-                  f.write(
-
-                      f"- "
-                      f"{asset['size_mb']:.2f} MB "
-                      f"`{asset['path']}`\n"
-
-                  )
-
-          PY
-
-      # ==========================================================
-      # 15. GIT LFS
-      # ==========================================================
-
-      - name: Configure Git LFS
-        run: |
-
-          git lfs install
-
-          cat > .gitattributes <<'EOF'
-
-          # Blender
-          *.blend filter=lfs diff=lfs merge=lfs -text
-
-          # 3D models
-          *.fbx filter=lfs diff=lfs merge=lfs -text
-          *.obj filter=lfs diff=lfs merge=lfs -text
-          *.glb filter=lfs diff=lfs merge=lfs -text
-          *.gltf filter=lfs diff=lfs merge=lfs -text
-          *.dae filter=lfs diff=lfs merge=lfs -text
-          *.3ds filter=lfs diff=lfs merge=lfs -text
-          *.stl filter=lfs diff=lfs merge=lfs -text
-          *.ply filter=lfs diff=lfs merge=lfs -text
-          *.abc filter=lfs diff=lfs merge=lfs -text
-
-          # USD
-          *.usd filter=lfs diff=lfs merge=lfs -text
-          *.usda filter=lfs diff=lfs merge=lfs -text
-          *.usdc filter=lfs diff=lfs merge=lfs -text
-          *.usdz filter=lfs diff=lfs merge=lfs -text
-
-          # DCC
-          *.max filter=lfs diff=lfs merge=lfs -text
-          *.ma filter=lfs diff=lfs merge=lfs -text
-          *.mb filter=lfs diff=lfs merge=lfs -text
-          *.c4d filter=lfs diff=lfs merge=lfs -text
-
-          # Textures
-          *.psd filter=lfs diff=lfs merge=lfs -text
-          *.exr filter=lfs diff=lfs merge=lfs -text
-          *.hdr filter=lfs diff=lfs merge=lfs -text
-          *.dds filter=lfs diff=lfs merge=lfs -text
-          *.tga filter=lfs diff=lfs merge=lfs -text
-
-          EOF
-
-      # ==========================================================
-      # 16. COPY PROJECT
-      # ==========================================================
-
-      - name: Import extracted project
-        run: |
-
-          cp -a extracted/. ./
-
-      # ==========================================================
-      # 17. REMOVE ONLY ARCHIVES + TEMPORARY FILES
-      # ==========================================================
-
-      - name: Remove imported archives
-        run: |
-
-          find . \
-            -type f \
-            \( \
-              -iname "*.rar" \
-              -o -iname "*.zip" \
-              -o -iname "*.7z" \
-              -o -iname "*.tar" \
-              -o -iname "*.tar.gz" \
-              -o -iname "*.tgz" \
-              -o -iname "*.tar.bz2" \
-              -o -iname "*.tar.xz" \
-            \) \
-            -delete
-
-          find . \
-            -type f \
-            \( \
-              -name "Thumbs.db" \
-              -o -name ".DS_Store" \
-              -o -name "desktop.ini" \
-            \) \
-            -delete
-
-      # ==========================================================
-      # 18. GITIGNORE
-      # ==========================================================
-
-      - name: Create Git ignore
-        run: |
-
-          cat >> .gitignore <<'EOF'
-
-          # Telegram downloads
-          downloads/
-
-          # Partial downloads
-          *.part
-          *.checkpoint
-
-          # Extraction workspace
-          extracted/
-
-          # Python
-          __pycache__/
-          *.pyc
-
-          # OS
-          .DS_Store
-          Thumbs.db
-          desktop.ini
-
-          # Temporary
-          *.tmp
-          *.temp
-
-          EOF
-
-      # ==========================================================
-      # 19. PREPARE LFS FOR LARGE 3D FILES
-      # ==========================================================
-
-      - name: Track large 3D assets
-        run: |
-
-          find . \
-            -type f \
-            -size +50M \
-            -print0 \
-          | while IFS= read -r -d '' file; do
-
-              case "$file" in
-
-                *.blend|\
-                *.fbx|\
-                *.obj|\
-                *.glb|\
-                *.gltf|\
-                *.dae|\
-                *.3ds|\
-                *.stl|\
-                *.ply|\
-                *.abc|\
-                *.usd|\
-                *.usda|\
-                *.usdc|\
-                *.usdz|\
-                *.max|\
-                *.ma|\
-                *.mb|\
-                *.c4d|\
-                *.psd|\
-                *.exr|\
-                *.hdr|\
-                *.dds|\
-                *.tga)
-
-                  echo "LFS:"
-                  echo "$file"
-
-                  git lfs track "$file"
-
-                  ;;
-
-              esac
-
-          done
-
-      # ==========================================================
-      # 20. GENERATE IMPORT MANIFEST
-      # ==========================================================
-
-      - name: Generate import information
-        run: |
-
-          mkdir -p docs
-
-          cp ASSET_MANIFEST.json \
-            docs/ASSET_MANIFEST.json
-
-          cp ASSET_RELATIONS.json \
-            docs/ASSET_RELATIONS.json
-
-          cp DUPLICATES.json \
-            docs/DUPLICATES.json
-
-          cp extraction-log.json \
-            docs/EXTRACTION_LOG.json
-
-          cp checksums/SHA256SUMS.txt \
-            docs/SHA256SUMS.txt
-
-      # ==========================================================
-      # 21. FINAL SCAN
-      # ==========================================================
-
-      - name: Final repository scan
-        run: |
-
-          echo
-          echo "=============================="
-          echo "3D ASSET COUNT"
-          echo "=============================="
-
-          find . \
-            -type f \
-            \( \
-              -iname "*.blend" \
-              -o -iname "*.fbx" \
-              -o -iname "*.obj" \
-              -o -iname "*.glb" \
-              -o -iname "*.gltf" \
-              -o -iname "*.dae" \
-              -o -iname "*.3ds" \
-              -o -iname "*.stl" \
-              -o -iname "*.ply" \
-              -o -iname "*.usd" \
-              -o -iname "*.usda" \
-              -o -iname "*.usdc" \
-              -o -iname "*.usdz" \
-            \) \
-            | wc -l
-
-          echo
-          echo "=============================="
-          echo "LFS STATUS"
-          echo "=============================="
-
-          git lfs status || true
-
-          echo
-          echo "=============================="
-          echo "GIT STATUS"
-          echo "=============================="
-
-          git status --short
-
-      # ==========================================================
-      # 22. STAGE
-      # ==========================================================
-
-      - name: Stage files
-        run: |
-
-          git add .
-
-      # ==========================================================
-      # 23. CHECK COMMIT
-      # ==========================================================
-
-      - name: Check staged changes
-        run: |
-
-          git diff \
-            --cached \
-            --stat
-
-          echo
-
-          git diff \
-            --cached \
-            --name-status \
-            | head -1000
-
-      # ==========================================================
-      # 24. COMMIT
-      # ==========================================================
-
-      - name: Commit imported assets
-        run: |
-
-          if git diff \
-            --cached \
-            --quiet; then
-
-            echo "Nothing to commit."
-
-          else
-
-            git commit \
-              -m "Import iCity 3D assets"
-
-          fi
-
-      # ==========================================================
-      # 25. PUSH
-      # ==========================================================
-
-      - name: Push to GitHub
-        run: |
-
-          git push origin HEAD:main
+      - name: Download extracted workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: extraction-state
+          path: |
+            extracted
+            extraction-log.json
+          retention-days: 7
