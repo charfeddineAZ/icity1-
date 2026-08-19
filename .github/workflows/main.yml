@@ -607,21 +607,41 @@ jobs:
           key: ${{ needs.download.outputs.cache_key }}
           fail-on-cache-miss: true
 
-      - name: Install archive tools and rclone
+      - name: Install archive tools and rclone (resilient)
         run: |
           set -euo pipefail
-          retry() {
-            local n=1
-            local max=3
-            until "$@"; do
-              if [ $n -ge $max ]; then return 1; fi
-              echo "⚠️ إعادة المحاولة $n/$max: $*"
-              n=$((n+1))
-              sleep 5
-            done
-          }
-          retry sudo apt-get update
-          retry sudo apt-get install -y p7zip-full p7zip-rar unrar unzip jq file tree rclone
+          export DEBIAN_FRONTEND=noninteractive
+
+          echo "🔄 محاولة تحديث الفهارس (مع مهلات قصيرة)..."
+          sudo apt-get update -o Acquire::http::Timeout=15 \
+                               -o Acquire::https::Timeout=15 \
+                               -o Acquire::Retries=2 \
+                               -o Acquire::ForceIPv4=true \
+            || echo "⚠️ فشل apt-get update، سنحاول التثبيت مباشرة"
+
+          echo "📦 تثبيت الأدوات..."
+          sudo apt-get install -y --no-install-recommends \
+            p7zip-full p7zip-rar unrar unzip jq file tree rclone \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o Acquire::Retries=3 \
+            -o Acquire::ForceIPv4=true \
+            || {
+              echo "❌ فشل التثبيت من المستودعات، محاولة بديلة..."
+              sudo apt-get install -y p7zip-full unrar unzip rclone
+            }
+
+          # إذا لم يتوفر rclone، ثبتّه يدويًا
+          if ! command -v rclone >/dev/null; then
+            echo "⚠️ rclone غير موجود، تثبيت يدوي..."
+            curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+            unzip rclone-current-linux-amd64.zip
+            cd rclone-*-linux-amd64
+            sudo cp rclone /usr/local/bin/
+            cd ..
+          fi
+
+          echo "✅ تم تثبيت الأدوات"
 
       - name: Test real archives only (non-blocking)
         run: |
