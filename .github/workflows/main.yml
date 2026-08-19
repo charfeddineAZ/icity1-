@@ -1,10 +1,10 @@
-name: Telegram 3D Smart Import
+name: Telegram 3D Import to Google Drive (No Limits)
 
 on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "Telegram channel username"
+        description: "Telegram channel username (بدون @)"
         required: true
         default: "svalkacg"
 
@@ -19,439 +19,316 @@ on:
         default: "iCity Cyberpunk"
 
       max_depth:
-        description: "Maximum nested archive depth"
+        description: "أقصى عمق للاستخراج (0 = غير محدود)"
         required: true
-        default: "10"
+        default: "100"
 
       force_download:
-        description: "Ignore existing cache and download again"
+        description: "تجاهل الكاش وإعادة التحميل"
+        required: true
+        type: boolean
+        default: false
+
+      delete_archives_after_upload:
+        description: "حذف الأرشيفات الأصلية بعد رفعها إلى Drive"
         required: true
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: telegram-3d-import
+  group: telegram-3d-import-${{ inputs.channel }}-${{ inputs.message_id }}-${{ inputs.prefix }}
   cancel-in-progress: false
 
 env:
-  CHANNEL: ${{ inputs.channel }}
-  MESSAGE_ID: ${{ inputs.message_id }}
-  ARCHIVE_PREFIX: ${{ inputs.prefix }}
-  MAX_ARCHIVE_DEPTH: ${{ inputs.max_depth }}
+  PYTHONUNBUFFERED: "1"
 
 jobs:
 
   # ============================================================
-  # JOB 1 — DISCOVERY
+  # JOB 0 — PREFLIGHT
   # ============================================================
-
-  discover:
-
+  preflight:
     runs-on: ubuntu-latest
-
-    outputs:
-      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+    timeout-minutes: 5
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Validate mandatory secrets
+        env:
+          TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          GDRIVE_SERVICE_ACCOUNT_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_B64 }}
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install telethon
+          set -euo pipefail
+          test -n "$TELEGRAM_SESSION_B64" || { echo "❌ TELEGRAM_SESSION_B64 مفقود"; exit 1; }
+          test -n "$TELEGRAM_API_ID" || { echo "❌ TELEGRAM_API_ID مفقود"; exit 1; }
+          test -n "$TELEGRAM_API_HASH" || { echo "❌ TELEGRAM_API_HASH مفقود"; exit 1; }
+          test -n "$GDRIVE_SERVICE_ACCOUNT_B64" || { echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 مفقود"; exit 1; }
+
+          DECODED_SIZE=$(printf '%s' "$TELEGRAM_SESSION_B64" | base64 -d 2>/dev/null | wc -c)
+          if [ "$DECODED_SIZE" -lt 10 ]; then
+            echo "❌ TELEGRAM_SESSION_B64 غير صالح"
+            exit 1
+          fi
+          DECODED_SA_SIZE=$(printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d 2>/dev/null | wc -c)
+          if [ "$DECODED_SA_SIZE" -lt 50 ]; then
+            echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 غير صالح"
+            exit 1
+          fi
+          echo "✅ جميع الأسرار الإلزامية موجودة"
+
+      - name: Validate numeric inputs
+        run: |
+          set -euo pipefail
+          if ! [[ "${{ inputs.message_id }}" =~ ^[0-9]+$ ]]; then
+            echo "❌ message_id يجب أن يكون رقمًا صحيحًا"
+            exit 1
+          fi
+          if ! [[ "${{ inputs.max_depth }}" =~ ^[0-9]+$ ]]; then
+            echo "❌ max_depth يجب أن يكون عددًا صحيحًا (0 = غير محدود)"
+            exit 1
+          fi
+          echo "✅ المدخلات الرقمية صالحة"
+
+
+  # ============================================================
+  # JOB 1 — DISCOVERY
+  # ============================================================
+  discover:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+      channel: ${{ steps.validate.outputs.channel }}
+      message_id: ${{ steps.validate.outputs.message_id }}
+      prefix: ${{ steps.validate.outputs.prefix }}
+      max_depth: ${{ steps.validate.outputs.max_depth }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate and clean inputs
+        id: validate
+        run: |
+          set -euo pipefail
+          CLEAN_CHANNEL="$(printf '%s' "${{ inputs.channel }}" | tr -d '@' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_')"
+          if [ -z "$CLEAN_CHANNEL" ]; then
+            echo "❌ اسم القناة غير صالح"
+            exit 1
+          fi
+          echo "CHANNEL=$CLEAN_CHANNEL" >> "$GITHUB_ENV"
+          echo "channel=$CLEAN_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "MESSAGE_ID=${{ inputs.message_id }}" >> "$GITHUB_ENV"
+          echo "message_id=${{ inputs.message_id }}" >> "$GITHUB_OUTPUT"
+
+          # إذا كان max_depth = 0 يعني غير محدود، نضع قيمة كبيرة جدًا
+          DEPTH="${{ inputs.max_depth }}"
+          if [ "$DEPTH" == "0" ]; then
+            DEPTH="999999"
+          fi
+          echo "MAX_ARCHIVE_DEPTH=$DEPTH" >> "$GITHUB_ENV"
+          echo "max_depth=$DEPTH" >> "$GITHUB_OUTPUT"
+
+          PREFIX_CLEAN="$(printf '%s' "${{ inputs.prefix }}" | tr -d '\n\r')"
+          echo "ARCHIVE_PREFIX=$PREFIX_CLEAN" >> "$GITHUB_ENV"
+          echo "prefix=$PREFIX_CLEAN" >> "$GITHUB_OUTPUT"
+
+      - name: Install Python (with retry)
+        run: |
+          set -euo pipefail
+          retry() {
+            local n=1
+            local max=3
+            until "$@"; do
+              if [ $n -ge $max ]; then return 1; fi
+              echo "⚠️ إعادة المحاولة $n/$max: $*"
+              n=$((n+1))
+              sleep 5
+            done
+          }
+          retry python3 -m pip install --upgrade pip
+          retry python3 -m pip install telethon
 
       - name: Restore Telegram session
         env:
           TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
         run: |
-
-          test -n "$TELEGRAM_SESSION_B64"
-
+          set -euo pipefail
           mkdir -p secrets
-
-          printf '%s' "$TELEGRAM_SESSION_B64" \
-            | base64 -d \
-            > secrets/telegram_session.session
-
+          printf '%s' "$TELEGRAM_SESSION_B64" | base64 -d > secrets/telegram_session.session
           chmod 600 secrets/telegram_session.session
 
       - name: Discover archive volumes
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-
         run: |
-
+          set -euo pipefail
           cat > discover.py <<'PY'
-
           import os
           import re
           import json
           import asyncio
+          import sys
 
-          from telethon import TelegramClient
+          from telethon import TelegramClient, errors
 
+          API_ID = int(os.environ["TELEGRAM_API_ID"])
+          API_HASH = os.environ["TELEGRAM_API_HASH"]
+          CHANNEL = os.environ["CHANNEL"].lstrip('@')
+          MESSAGE_ID = int(os.environ["MESSAGE_ID"])
+          PREFIX = os.environ["ARCHIVE_PREFIX"].lower()
 
-          API_ID = int(
-              os.environ["TELEGRAM_API_ID"]
+          ARCHIVE_EXTENSIONS = (
+              '.rar', '.zip', '.7z',
+              '.tar', '.tar.gz', '.tgz',
+              '.tar.bz2', '.tbz2', '.tar.xz', '.txz'
           )
-
-          API_HASH = os.environ[
-              "TELEGRAM_API_HASH"
-          ]
-
-          CHANNEL = os.environ["CHANNEL"]
-
-          MESSAGE_ID = int(
-              os.environ["MESSAGE_ID"]
-          )
-
-          PREFIX = os.environ[
-              "ARCHIVE_PREFIX"
-          ]
-
 
           def normalize(name):
-
               name = name.lower()
-
-              name = re.sub(
-                  r'\.part\d+\.rar$',
-                  '',
-                  name,
-                  flags=re.I
-              )
-
-              name = re.sub(
-                  r'\.r\d+$',
-                  '',
-                  name,
-                  flags=re.I
-              )
-
-              name = re.sub(
-                  r'\.\d{3}$',
-                  '',
-                  name,
-                  flags=re.I
-              )
-
+              name = re.sub(r'\.part\d+\.(?:rar|zip|7z|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz)$', '', name, flags=re.I)
+              name = re.sub(r'\.r\d+$', '', name, flags=re.I)
+              name = re.sub(r'\.\d{3}$', '', name, flags=re.I)
               return name
 
-
           def volume_number(name):
-
-              m = re.search(
-                  r'\.part(\d+)\.rar$',
-                  name,
-                  re.I
-              )
-
+              m = re.search(r'\.part(\d+)\.(?:rar|zip|7z|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz)$', name, re.I)
               if m:
                   return int(m.group(1))
-
-              m = re.search(
-                  r'\.r(\d+)$',
-                  name,
-                  re.I
-              )
-
+              m = re.search(r'\.r(\d+)$', name, re.I)
               if m:
                   return int(m.group(1))
-
-              m = re.search(
-                  r'\.(\d{3})$',
-                  name,
-                  re.I
-              )
-
+              m = re.search(r'\.(\d{3})$', name, re.I)
               if m:
                   return int(m.group(1))
-
               return 1
 
-
           async def main():
-
-              client = TelegramClient(
-                  "secrets/telegram_session",
-                  API_ID,
-                  API_HASH
-              )
-
-              await client.start()
+              client = TelegramClient("secrets/telegram_session", API_ID, API_HASH)
+              try:
+                  await client.start()
+              except Exception as e:
+                  print(f"❌ فشل الاتصال بتيليجرام: {e!r}")
+                  sys.exit(1)
 
               found = {}
-
-              # Search a wider area so multipart volumes
-              # posted in nearby messages are discovered.
-
-              start = max(
-                  1,
-                  MESSAGE_ID - 3000
-              )
-
+              start = max(1, MESSAGE_ID - 3000)
               end = MESSAGE_ID + 3000
 
-              async for message in client.iter_messages(
-
-                  CHANNEL,
-
-                  min_id=start,
-
-                  max_id=end
-
-              ):
-
-                  if not message.file:
-                      continue
-
-                  name = (
-                      message.file.name
-                      or ""
-                  )
-
-                  if not name:
-                      continue
-
-                  lower = name.lower()
-
-                  archive = (
-
-                      lower.endswith(".rar")
-                      or
-                      lower.endswith(".zip")
-                      or
-                      lower.endswith(".7z")
-                      or
-                      lower.endswith(".tar")
-                      or
-                      lower.endswith(".tar.gz")
-                      or
-                      lower.endswith(".tgz")
-                      or
-                      lower.endswith(".tar.bz2")
-                      or
-                      lower.endswith(".tar.xz")
-
-                  )
-
-                  if not archive:
-                      continue
-
-                  if PREFIX.lower() not in lower:
-                      continue
-
-                  found[message.id] = {
-
-                      "message_id":
-                          message.id,
-
-                      "name":
-                          name,
-
-                      "size":
-                          int(message.file.size),
-
-                      "volume":
-                          volume_number(name),
-
-                      "base":
-                          normalize(name)
-
-                  }
-
-              await client.disconnect()
+              try:
+                  async for message in client.iter_messages(CHANNEL, min_id=start, max_id=end, limit=10000):
+                      if not message.file:
+                          continue
+                      name = message.file.name or ""
+                      if not name:
+                          continue
+                      lower = name.lower()
+                      if not any(lower.endswith(ext) for ext in ARCHIVE_EXTENSIONS):
+                          continue
+                      if PREFIX not in lower:
+                          continue
+                      found[message.id] = {
+                          "message_id": message.id,
+                          "name": name,
+                          "size": int(message.file.size),
+                          "volume": volume_number(name),
+                          "base": normalize(name)
+                      }
+              except errors.FloodWaitError as e:
+                  print(f"❌ FloodWaitError: {e.seconds} ثانية")
+                  sys.exit(1)
+              except Exception as e:
+                  print(f"❌ خطأ أثناء جلب الرسائل: {e!r}")
+                  sys.exit(1)
+              finally:
+                  if client.is_connected():
+                      await client.disconnect()
 
               if not found:
+                  raise RuntimeError("No matching Telegram files found.")
 
-                  raise RuntimeError(
-                      "No matching Telegram files found."
-                  )
-
-              volumes = list(
-                  found.values()
-              )
-
-              volumes.sort(
-                  key=lambda x: (
-                      x["base"],
-                      x["volume"],
-                      x["message_id"]
-                  )
-              )
-
-              # Group by archive base name.
+              volumes = list(found.values())
+              volumes.sort(key=lambda x: (x["base"], x["volume"], x["message_id"]))
 
               groups = {}
-
               for item in volumes:
+                  groups.setdefault(item["base"], []).append(item)
 
-                  groups.setdefault(
-                      item["base"],
-                      []
-                  ).append(item)
+              candidates = [items for base, items in groups.items() if PREFIX in base]
+              if not candidates:
+                  raise RuntimeError("No matching archive group.")
 
-              # Select group matching requested prefix.
-
-              selected = []
-
-              for base, items in groups.items():
-
-                  if PREFIX.lower() in base:
-
-                      selected.extend(items)
-
-              if not selected:
-
-                  raise RuntimeError(
-                      "No matching archive group."
-                  )
-
-              selected.sort(
-                  key=lambda x: (
-                      x["volume"],
-                      x["message_id"]
-                  )
-              )
-
-              # Remove duplicate Telegram messages
-              # representing the same volume.
+              selected = max(candidates, key=lambda items: (len(items), sum(x["size"] for x in items)))
+              selected.sort(key=lambda x: (x["volume"], x["message_id"]))
 
               unique = {}
-
               for item in selected:
-
-                  key = (
-                      item["base"],
-                      item["volume"]
-                  )
-
-                  if key not in unique:
-
+                  key = (item["base"], item["volume"])
+                  if key not in unique or item["size"] > unique[key]["size"]:
                       unique[key] = item
 
-                  else:
+              selected = list(unique.values())
+              selected.sort(key=lambda x: (x["base"], x["volume"], x["message_id"]))
 
-                      # Prefer the larger file if duplicate
-                      # metadata appears.
+              vols = [x["volume"] for x in selected]
+              print("Detected volumes:", vols)
 
-                      old = unique[key]
-
-                      if item["size"] > old["size"]:
-
-                          unique[key] = item
-
-              selected = list(
-                  unique.values()
-              )
-
-              selected.sort(
-                  key=lambda x: x["volume"]
-              )
-
-              # Check volume sequence.
-
-              volumes = [
-                  x["volume"]
-                  for x in selected
-              ]
-
-              print(
-                  "Detected volumes:",
-                  volumes
-              )
-
-              if len(volumes) > 1:
-
-                  expected = list(
-                      range(
-                          min(volumes),
-                          max(volumes) + 1
-                      )
-                  )
-
-                  missing = [
-                      x
-                      for x in expected
-                      if x not in volumes
-                  ]
-
+              if len(vols) > 1:
+                  expected = list(range(min(vols), max(vols)+1))
+                  missing = [v for v in expected if v not in vols]
                   if missing:
+                      raise RuntimeError("Missing archive volumes: " + ", ".join(str(x) for x in missing))
 
-                      raise RuntimeError(
+              with open("archives.json", "w") as f:
+                  json.dump(selected, f, indent=2, sort_keys=True)
 
-                          "Missing archive volumes: "
-                          +
-                          ", ".join(
-                              str(x)
-                              for x in missing
-                          )
+              print(json.dumps(selected, indent=2))
 
-                      )
-
-              with open(
-                  "archives.json",
-                  "w"
-              ) as f:
-
-                  json.dump(
-                      selected,
-                      f,
-                      indent=2,
-                      sort_keys=True
-                  )
-
-              print(
-                  json.dumps(
-                      selected,
-                      indent=2
-                  )
-              )
-
-
-          asyncio.run(main())
-
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
-
           python3 discover.py
 
-      - name: Generate immutable archive fingerprint
-        id: fingerprint
+      - name: Validate archives.json structure
         run: |
-
           python3 - <<'PY'
-
-          import hashlib
-          import json
-
-          with open("archives.json", "rb") as f:
-              data = f.read()
-
-          digest = hashlib.sha256(
-              data
-          ).hexdigest()
-
-          print(
-              "fingerprint=" + digest
-          )
-
-          with open(
-              "fingerprint.txt",
-              "w"
-          ) as f:
-
-              f.write(digest)
-
+          import json, sys
+          with open("archives.json") as f:
+              data = json.load(f)
+          if not isinstance(data, list) or len(data) == 0:
+              print("❌ archives.json غير صالح")
+              sys.exit(1)
+          required = {"message_id", "name", "size", "volume", "base"}
+          for item in data:
+              if not required.issubset(item.keys()):
+                  print(f"❌ عنصر ناقص: {item}")
+                  sys.exit(1)
+          print("✅ archives.json سليم")
           PY
 
-          echo "fingerprint=$(cat fingerprint.txt)" \
-            >> "$GITHUB_OUTPUT"
+      - name: Generate fingerprint
+        id: fingerprint
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          with open("archives.json", "rb") as f:
+              data = f.read()
+          digest = hashlib.sha256(data).hexdigest()
+          print("fingerprint=" + digest)
+          with open("fingerprint.txt", "w") as f:
+              f.write(digest)
+          PY
+          echo "fingerprint=$(cat fingerprint.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Upload discovery metadata
         uses: actions/upload-artifact@v4
@@ -466,18 +343,21 @@ jobs:
   # ============================================================
   # JOB 2 — DOWNLOAD
   # ============================================================
-
   download:
-
     needs: discover
-
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     outputs:
-      cache_key: ${{ steps.cache_key.outputs.key }}
+      cache_key: ${{ steps.cache_key.outputs.save_key }}
+
+    env:
+      CHANNEL: ${{ needs.discover.outputs.channel }}
+      MESSAGE_ID: ${{ needs.discover.outputs.message_id }}
+      ARCHIVE_PREFIX: ${{ needs.discover.outputs.prefix }}
+      MAX_ARCHIVE_DEPTH: ${{ needs.discover.outputs.max_depth }}
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -486,51 +366,64 @@ jobs:
         with:
           name: telegram-discovery
 
+      - name: Validate archives.json
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          with open("archives.json") as f:
+              data = json.load(f)
+          if not isinstance(data, list) or len(data) == 0:
+              print("❌ archives.json غير صالح")
+              sys.exit(1)
+          print("✅ archives.json سليم")
+          PY
+
       - name: Generate cache key
         id: cache_key
         run: |
-
-          KEY="telegram-3d-${CHANNEL}-${{ needs.discover.outputs.fingerprint }}"
-
-          echo "key=$KEY" \
-            >> "$GITHUB_OUTPUT"
-
-          echo "$KEY"
-
-      # --------------------------------------------------------
-      # IMPORTANT:
-      # The archive is cached using the Telegram metadata
-      # fingerprint.
-      #
-      # Same files => same cache key => no new Telegram download.
-      # --------------------------------------------------------
+          BASE="telegram-3d-${CHANNEL}-${{ needs.discover.outputs.fingerprint }}"
+          if [ "${{ inputs.force_download }}" == "true" ]; then
+            SAVE_KEY="${BASE}-force-${GITHUB_RUN_ID}"
+          else
+            SAVE_KEY="${BASE}"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "save_key=$SAVE_KEY" >> "$GITHUB_OUTPUT"
 
       - name: Restore archive cache
+        if: inputs.force_download == false
         id: archive-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: telegram_cache
-          key: ${{ steps.cache_key.outputs.key }}
+          key: ${{ steps.cache_key.outputs.base }}
+          restore-keys: |
+            ${{ steps.cache_key.outputs.base }}-
 
-      - name: Install Telethon
+      - name: Install Telethon (retry)
         if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
         run: |
-
-          python3 -m pip install --upgrade pip
-          python3 -m pip install telethon
+          set -euo pipefail
+          retry() {
+            local n=1
+            local max=3
+            until "$@"; do
+              if [ $n -ge $max ]; then return 1; fi
+              echo "⚠️ إعادة المحاولة $n/$max: $*"
+              n=$((n+1))
+              sleep 5
+            done
+          }
+          retry python3 -m pip install --upgrade pip
+          retry python3 -m pip install telethon
 
       - name: Restore Telegram session
         if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
         env:
           TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
         run: |
-
           mkdir -p secrets
-
-          printf '%s' "$TELEGRAM_SESSION_B64" \
-            | base64 -d \
-            > secrets/telegram_session.session
-
+          printf '%s' "$TELEGRAM_SESSION_B64" | base64 -d > secrets/telegram_session.session
           chmod 600 secrets/telegram_session.session
 
       - name: Download multipart archives
@@ -538,698 +431,526 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-
         run: |
-
-          mkdir -p telegram_cache
-          mkdir -p telegram_partial
-
+          set -euo pipefail
+          mkdir -p telegram_cache telegram_partial
           cat > download.py <<'PY'
-
           import os
           import json
           import asyncio
-
+          import shutil
+          import random
           from pathlib import Path
 
-          from telethon import TelegramClient
+          from telethon import TelegramClient, errors
 
-
-          API_ID = int(
-              os.environ["TELEGRAM_API_ID"]
-          )
-
-          API_HASH = os.environ[
-              "TELEGRAM_API_HASH"
-          ]
-
-          CHANNEL = os.environ[
-              "CHANNEL"
-          ]
-
+          API_ID = int(os.environ["TELEGRAM_API_ID"])
+          API_HASH = os.environ["TELEGRAM_API_HASH"]
+          CHANNEL = os.environ["CHANNEL"]
           CHUNK_SIZE = 8 * 1024 * 1024
-
           MAX_RETRIES = 12
 
-
-          async def download_one(
-              client,
-              item
-          ):
-
+          async def download_one(client, item):
               name = item["name"]
+              expected = int(item["size"])
+              final = Path("telegram_cache") / name
+              partial = Path("telegram_partial") / (name + ".part")
 
-              expected = int(
-                  item["size"]
-              )
-
-              final = (
-                  Path("telegram_cache")
-                  / name
-              )
-
-              partial = (
-                  Path("telegram_partial")
-                  / (name + ".part")
-              )
+              if final.exists() and final.stat().st_size == expected:
+                  print(f"Already complete: {name}")
+                  return
 
               if final.exists():
-
-                  if (
-                      final.stat().st_size
-                      == expected
-                  ):
-
-                      print(
-                          "Already complete:",
-                          name
-                      )
-
-                      return
-
-                  print(
-                      "Invalid cached file:",
-                      name
-                  )
-
+                  print(f"Invalid cached file, removing: {name}")
                   final.unlink()
 
-              for attempt in range(
-                  1,
-                  MAX_RETRIES + 1
-              ):
-
+              for attempt in range(1, MAX_RETRIES + 1):
                   try:
+                      if partial.exists() and partial.stat().st_size > expected:
+                          partial.unlink()
 
-                      current = (
+                      current = partial.stat().st_size if partial.exists() else 0
+                      print(f"\nDownloading: {name} (Attempt {attempt}/{MAX_RETRIES})")
 
-                          partial.stat().st_size
-
-                          if partial.exists()
-
-                          else 0
-
-                      )
-
-                      print()
-                      print(
-                          "================================"
-                      )
-
-                      print(
-                          f"Downloading: {name}"
-                      )
-
-                      print(
-                          f"Attempt: "
-                          f"{attempt}/{MAX_RETRIES}"
-                      )
-
-                      print(
-                          f"Resume at: "
-                          f"{current / 1024**3:.3f} GiB"
-                      )
-
-                      message = (
-                          await client.get_messages(
-                              CHANNEL,
-                              ids=item[
-                                  "message_id"
-                              ]
-                          )
-                      )
-
+                      message = await client.get_messages(CHANNEL, ids=item["message_id"])
                       if not message:
+                          raise RuntimeError("Telegram message disappeared.")
 
-                          raise RuntimeError(
-                              "Telegram message disappeared."
-                          )
-
-                      with open(
-                          partial,
-                          "ab"
-                      ) as f:
-
-                          async for chunk in client.iter_download(
-
-                              message.media,
-
-                              offset=current,
-
-                              request_size=CHUNK_SIZE
-
-                          ):
-
+                      with open(partial, "ab") as f:
+                          async for chunk in client.iter_download(message.media, offset=current, request_size=CHUNK_SIZE):
                               f.write(chunk)
-
                               f.flush()
-
                               current += len(chunk)
+                              if current % (256 * 1024 * 1024) < CHUNK_SIZE:
+                                  print(f"{current/1024**3:.3f} / {expected/1024**3:.3f} GiB")
 
-                              if current % (
-                                  256 * 1024 * 1024
-                              ) < CHUNK_SIZE:
+                      if partial.stat().st_size != expected:
+                          raise RuntimeError(f"Size mismatch: {partial.stat().st_size} != {expected}")
 
-                                  print(
-
-                                      f"{current / 1024**3:.3f}"
-                                      f" / "
-                                      f"{expected / 1024**3:.3f}"
-                                      f" GiB"
-
-                                  )
-
-                      final_size = (
-                          partial.stat().st_size
-                      )
-
-                      if final_size != expected:
-
-                          raise RuntimeError(
-
-                              f"Size mismatch: "
-                              f"{final_size} != "
-                              f"{expected}"
-
-                          )
-
-                      os.replace(
-                          partial,
-                          final
-                      )
-
-                      print(
-                          "COMPLETE:",
-                          name
-                      )
-
+                      os.replace(partial, final)
+                      print(f"COMPLETE: {name}")
                       return
 
-                  except Exception as exc:
-
-                      print(
-                          "DOWNLOAD ERROR:",
-                          repr(exc)
-                      )
-
+                  except errors.FloodWaitError as e:
+                      print(f"⚠️ FloodWaitError: {e.seconds} ثانية")
                       if attempt >= MAX_RETRIES:
-
                           raise
-
-                      delay = min(
-                          300,
-                          15 * attempt
-                      )
-
-                      print(
-                          f"Retrying in "
-                          f"{delay}s..."
-                      )
-
-                      await asyncio.sleep(
-                          delay
-                      )
-
+                      await asyncio.sleep(min(e.seconds + random.uniform(1, 5), 300))
+                  except Exception as exc:
+                      print(f"DOWNLOAD ERROR: {exc!r}")
+                      if attempt >= MAX_RETRIES:
+                          raise
+                      if partial.exists() and partial.stat().st_size >= expected:
+                          partial.unlink()
+                      delay = min(300, 15 * attempt) + random.uniform(0, 5)
+                      print(f"Retrying in {delay:.1f}s...")
+                      await asyncio.sleep(delay)
 
           async def main():
+              client = TelegramClient("secrets/telegram_session", API_ID, API_HASH)
+              try:
+                  await client.start()
+              except Exception as e:
+                  print(f"❌ فشل الاتصال بتيليجرام: {e!r}")
+                  raise
+              try:
+                  with open("archives.json") as f:
+                      archives = json.load(f)
+                  for item in archives:
+                      await download_one(client, item)
+              finally:
+                  if client.is_connected():
+                      await client.disconnect()
 
-              client = TelegramClient(
-
-                  "secrets/telegram_session",
-
-                  API_ID,
-
-                  API_HASH
-
-              )
-
-              await client.start()
-
-              with open(
-                  "archives.json"
-              ) as f:
-
-                  archives = json.load(f)
-
-              for item in archives:
-
-                  await download_one(
-                      client,
-                      item
-                  )
-
-              await client.disconnect()
-
-
-          asyncio.run(main())
-
+          if __name__ == "__main__":
+              asyncio.run(main())
           PY
-
           python3 download.py
 
       - name: Validate downloaded volumes
         run: |
-
           python3 - <<'PY'
-
           import json
           from pathlib import Path
-
-          with open(
-              "archives.json"
-          ) as f:
-
+          with open("archives.json") as f:
               archives = json.load(f)
-
-          root = Path(
-              "telegram_cache"
-          )
-
+          root = Path("telegram_cache")
           for item in archives:
-
               path = root / item["name"]
-
               if not path.exists():
-
-                  raise RuntimeError(
-                      f"Missing: {path}"
-                  )
-
+                  raise RuntimeError(f"Missing: {path}")
               actual = path.stat().st_size
-
-              expected = int(
-                  item["size"]
-              )
-
+              expected = int(item["size"])
               if actual != expected:
-
-                  raise RuntimeError(
-
-                      f"Size mismatch for "
-                      f"{path}: "
-                      f"{actual} != "
-                      f"{expected}"
-
-                  )
-
-              print(
-                  "OK:",
-                  path
-              )
-
+                  raise RuntimeError(f"Size mismatch: {actual} != {expected}")
+              print(f"OK: {path}")
           PY
 
-      # The cache is saved automatically by actions/cache
-      # when this job completes successfully.
+      - name: Save archive cache
+        if: steps.archive-cache.outputs.cache-hit != 'true' || inputs.force_download == true
+        uses: actions/cache/save@v4
+        with:
+          path: telegram_cache
+          key: ${{ steps.cache_key.outputs.save_key }}
 
 
   # ============================================================
-  # JOB 3 — VERIFY + EXTRACT
+  # JOB 3 — EXTRACT & UPLOAD TO GOOGLE DRIVE
   # ============================================================
-
   extract:
-
     needs:
       - discover
       - download
-
     runs-on: ubuntu-latest
+    timeout-minutes: 720   # زيادة كبيرة للسماح بالعمليات الطويلة
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download discovery
+      - name: Download discovery metadata
         uses: actions/download-artifact@v4
         with:
           name: telegram-discovery
 
-      - name: Restore downloaded Telegram archive
-        uses: actions/cache@v4
+      - name: Validate archives.json
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          with open("archives.json") as f:
+              data = json.load(f)
+          if not isinstance(data, list) or len(data) == 0:
+              print("❌ archives.json غير صالح")
+              sys.exit(1)
+          print("✅ archives.json سليم")
+          PY
+
+      - name: Restore downloaded archive cache
+        uses: actions/cache/restore@v4
         with:
           path: telegram_cache
-          key: telegram-3d-${{ env.CHANNEL }}-${{ needs.discover.outputs.fingerprint }}
+          key: ${{ needs.download.outputs.cache_key }}
           fail-on-cache-miss: true
 
-      - name: Install archive tools
+      - name: Install archive tools and rclone
         run: |
+          set -euo pipefail
+          retry() {
+            local n=1
+            local max=3
+            until "$@"; do
+              if [ $n -ge $max ]; then return 1; fi
+              echo "⚠️ إعادة المحاولة $n/$max: $*"
+              n=$((n+1))
+              sleep 5
+            done
+          }
+          retry sudo apt-get update
+          retry sudo apt-get install -y p7zip-full p7zip-rar unrar unzip jq file tree rclone
 
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            p7zip-full \
-            p7zip-rar \
-            unrar \
-            unzip \
-            jq \
-            file \
-            tree
-
-      - name: Test real archives only
+      - name: Test real archives only (optional)
         run: |
-
-          set -e
-
+          set -euo pipefail
           python3 - <<'PY'
-
           import json
           import subprocess
           from pathlib import Path
 
-          with open(
-              "archives.json"
-          ) as f:
-
+          with open("archives.json") as f:
               archives = json.load(f)
 
-          root = Path(
-              "telegram_cache"
-          )
-
+          root = Path("telegram_cache")
           for item in archives:
-
-              archive = (
-                  root /
-                  item["name"]
-              )
-
-              print()
-              print(
-                  "=" * 70
-              )
-
-              print(
-                  "Testing:",
-                  archive
-              )
-
-              print(
-                  "=" * 70
-              )
-
-              subprocess.run(
-                  [
-                      "7z",
-                      "t",
-                      str(archive),
-                      "-y"
-                  ],
-                  check=True
-              )
-
-          PY
-
-      - name: Detect multipart archive
-        run: |
-
-          python3 - <<'PY'
-
-          import json
-
-          with open(
-              "archives.json"
-          ) as f:
-
-              archives = json.load(f)
-
-          print(
-              "Archive volumes:"
-          )
-
-          for item in archives:
-
-              print(
-                  f"  part {item['volume']}: "
-                  f"{item['name']}"
-              )
-
-          if len(archives) > 1:
-
-              print()
-              print(
-                  "MULTIVOLUME ARCHIVE DETECTED"
-              )
-
-              print(
-                  "All volumes are present."
-              )
-
+              archive = root / item["name"]
+              print(f"\nTesting: {archive}")
+              try:
+                  subprocess.run(["timeout", "30m", "7z", "t", str(archive), "-y"], check=True)
+              except subprocess.CalledProcessError:
+                  print(f"⚠️ فشل اختبار {archive}، سيتم المتابعة رغم ذلك")
           PY
 
       - name: Extract root archive
         run: |
-
-          set -e
-
+          set -euo pipefail
           mkdir -p extracted
 
-          FIRST="$(
-            python3 - <<'PY'
+          FIRST=$(python3 - <<'PY'
           import json
-
           with open("archives.json") as f:
               data = json.load(f)
-
-          data.sort(
-              key=lambda x: x["volume"]
-          )
-
-          print(
-              data[0]["name"]
-          )
+          data.sort(key=lambda x: x["volume"])
+          print(data[0]["name"])
           PY
-          )"
+          )
 
-          echo "Primary volume:"
-          echo "$FIRST"
+          echo "Primary volume: $FIRST"
+          timeout 60m 7z x "telegram_cache/$FIRST" -oextracted -y -aoa
 
-          7z x \
-            "telegram_cache/$FIRST" \
-            "-oextracted" \
-            -y \
-            -aoa
-
-      # ========================================================
-      # NESTED ARCHIVE EXTRACTION
-      # ========================================================
-
-      - name: Recursive extraction up to 10 levels
+      - name: Recursive extraction (بدون حدود للحجم/العدد)
         env:
-          MAX_ARCHIVE_DEPTH: ${{ env.MAX_ARCHIVE_DEPTH }}
-
+          MAX_ARCHIVE_DEPTH: ${{ needs.discover.outputs.max_depth }}
         run: |
-
+          set -euo pipefail
           cat > recursive_extract.py <<'PY'
-
           import os
+          import re
           import json
           import subprocess
-
+          import sys
           from pathlib import Path
 
+          ROOT = Path("extracted").resolve()
+          MAX_DEPTH = int(os.environ.get("MAX_ARCHIVE_DEPTH", "999999"))
 
-          ROOT = Path(
-              "extracted"
-          ).resolve()
-
-          MAX_DEPTH = int(
-              os.environ.get(
-                  "MAX_ARCHIVE_DEPTH",
-                  "10"
-              )
+          ARCHIVE_EXTENSIONS = (
+              ".zip", ".rar", ".7z",
+              ".tar", ".tar.gz", ".tgz",
+              ".tar.bz2", ".tbz2",
+              ".tar.xz", ".txz"
           )
 
+          def is_archive_file(path):
+              return any(path.name.lower().endswith(ext) for ext in ARCHIVE_EXTENSIONS)
 
-          EXTENSIONS = (
+          def multipart_key(name):
+              lower = name.lower()
+              m = re.match(r'^(.+)\.part(\d+)\.(zip|rar|7z|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz)$', lower)
+              if m:
+                  return (m.group(1), int(m.group(2)))
+              m = re.match(r'^(.+\.(?:zip|rar|7z|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz))\.(\d{3})$', lower)
+              if m:
+                  return (m.group(1), int(m.group(2)))
+              return None
 
-              ".zip",
-              ".rar",
-              ".7z",
-
-              ".tar",
-              ".tar.gz",
-              ".tgz",
-
-              ".tar.bz2",
-              ".tbz2",
-
-              ".tar.xz",
-              ".txz"
-
-          )
-
-
-          def is_archive(path):
-
-              name = path.name.lower()
-
-              return any(
-                  name.endswith(x)
-                  for x in EXTENSIONS
-              )
-
-
-          def safe_path(path):
-
+          def safe_path(path, root=ROOT):
               resolved = path.resolve()
+              return resolved == root or str(resolved).startswith(str(root) + os.sep)
 
-              return (
-
-                  resolved == ROOT
-
-                  or
-
-                  str(resolved).startswith(
-                      str(ROOT) + os.sep
-                  )
-
+          def check_archive_entries(archive_path):
+              print(f"  فحص محتويات: {archive_path.name}")
+              result = subprocess.run(
+                  ["7z", "l", "-slt", str(archive_path)],
+                  capture_output=True,
+                  text=True,
+                  timeout=60
               )
+              if result.returncode != 0:
+                  print("  ⚠️ تعذر فحص المحتويات")
+              for line in result.stdout.splitlines():
+                  if line.startswith("Path = "):
+                      entry = line[len("Path = "):].strip()
+                      if entry.startswith("/") or entry.startswith("\\"):
+                          raise RuntimeError(f"مسار مطلق ممنوع: {entry}")
+                      parts = entry.replace("\\", "/").split("/")
+                      if any(p == ".." for p in parts):
+                          raise RuntimeError(f"مسار خطير ممنوع: {entry}")
 
+          def extract_one(archive_path, destination):
+              destination.mkdir(parents=True, exist_ok=True)
+              print(f"Extracting: {archive_path} -> {destination}")
+              check_archive_entries(archive_path)
+              subprocess.run(
+                  ["timeout", "60m", "7z", "x", str(archive_path), f"-o{destination}", "-y", "-aoa"],
+                  check=True
+              )
+              for p in destination.rglob("*"):
+                  if p.is_symlink():
+                      raise RuntimeError(f"روابط رمزية غير مسموحة: {p}")
+                  if not safe_path(p):
+                      raise RuntimeError(f"مسار غير آمن: {p}")
 
           processed = set()
-
           log = []
 
-
-          for depth in range(
-              1,
-              MAX_DEPTH + 1
-          ):
-
-              candidates = []
+          for depth in range(1, MAX_DEPTH + 1):
+              multipart_groups = {}
+              singles = []
 
               for path in ROOT.rglob("*"):
-
-                  if not path.is_file():
+                  if not path.is_file() or path.is_symlink():
+                      continue
+                  rpath = str(path.resolve())
+                  if rpath in processed:
                       continue
 
-                  if not is_archive(path):
+                  key = multipart_key(path.name)
+                  if key:
+                      base, vol = key
+                      multipart_groups.setdefault(base, []).append((vol, path))
+                  elif is_archive_file(path):
+                      singles.append(path)
+
+              tasks = []
+
+              for base, parts in multipart_groups.items():
+                  if len(parts) < 2:
+                      for _, p in parts:
+                          singles.append(p)
                       continue
 
-                  key = str(
-                      path.resolve()
-                  )
+                  parts.sort(key=lambda x: x[0])
+                  vols = [p[0] for p in parts]
+                  expected = list(range(min(vols), max(vols)+1))
+                  missing = [v for v in expected if v not in vols]
+                  if missing:
+                      raise RuntimeError(f"Missing multipart volumes for {base}: {missing}")
 
-                  if key in processed:
-                      continue
+                  parent = parts[0][1].parent
+                  if any(p.parent != parent for _, p in parts):
+                      raise RuntimeError(f"Multipart parts for {base} not in same directory")
 
-                  if not safe_path(path):
+                  first_path = parts[0][1]
+                  dest = first_path.parent / (first_path.name + ".extracted")
+                  tasks.append((first_path, dest, [p for _, p in parts]))
 
-                      raise RuntimeError(
-                          f"Unsafe archive path: "
-                          f"{path}"
-                      )
+              for p in singles:
+                  dest = p.parent / (p.name + ".extracted")
+                  tasks.append((p, dest, [p]))
 
-                  candidates.append(path)
-
-              if not candidates:
-
-                  print(
-                      "No more nested archives."
-                  )
-
+              if not tasks:
+                  print("No more nested archives.")
                   break
 
-              print()
-              print(
-                  f"========== DEPTH {depth} =========="
-              )
+              print(f"\n========== DEPTH {depth} ==========")
+              for archive_path, dest, part_paths in tasks:
+                  if str(archive_path.resolve()) in processed:
+                      continue
 
-              for archive in candidates:
+                  extract_one(archive_path, dest)
 
-                  key = str(
-                      archive.resolve()
-                  )
-
-                  processed.add(key)
-
-                  destination = (
-                      archive.parent
-                      /
-                      (
-                          archive.name
-                          + ".extracted"
-                      )
-                  )
-
-                  destination.mkdir(
-                      parents=True,
-                      exist_ok=True
-                  )
-
-                  print(
-                      "Extracting:",
-                      archive
-                  )
-
-                  subprocess.run(
-
-                      [
-                          "7z",
-                          "x",
-                          str(archive),
-                          f"-o{destination}",
-                          "-y",
-                          "-aoa"
-                      ],
-
-                      check=True
-
-                  )
+                  for p in part_paths:
+                      processed.add(str(p.resolve()))
 
                   log.append({
-
-                      "depth":
-                          depth,
-
-                      "archive":
-                          str(archive),
-
-                      "destination":
-                          str(destination)
-
+                      "depth": depth,
+                      "archive": str(archive_path),
+                      "destination": str(dest)
                   })
 
-
-          with open(
-              "extraction-log.json",
-              "w"
-          ) as f:
-
-              json.dump(
-                  log,
-                  f,
-                  indent=2
-              )
-
+          with open("extraction-log.json", "w") as f:
+              json.dump(log, f, indent=2)
           PY
-
           python3 recursive_extract.py
 
+      - name: Analyze 3D content
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          ROOT = Path("extracted")
+          extensions = {
+              ".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds",
+              ".blend", ".max", ".ma", ".mb", ".usd", ".usdz", ".abc",
+              ".ply", ".wrl", ".x3d", ".3mf", ".amf"
+          }
+          stats = {}
+          total_size = 0
+          total_count = 0
+          for ext in extensions:
+              ext = ext.lower()
+              files = [p for p in ROOT.rglob(f"*{ext}")]
+              count = len(files)
+              size = sum(p.stat().st_size for p in files)
+              if count > 0:
+                  stats[ext] = {"count": count, "size": size}
+                  total_count += count
+                  total_size += size
+
+          report = {
+              "total_3d_files": total_count,
+              "total_3d_size": total_size,
+              "by_extension": stats
+          }
+          with open("analysis.json", "w") as f:
+              json.dump(report, f, indent=2)
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Configure rclone for Google Drive
+        env:
+          GDRIVE_SERVICE_ACCOUNT_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d > ~/.config/rclone/gdrive-sa.json
+          chmod 600 ~/.config/rclone/gdrive-sa.json
+
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = $HOME/.config/rclone/gdrive-sa.json
+          team_drive =
+          EOF
+
+          echo "✅ تم إعداد rclone"
+
+      - name: Upload archives and extracted files to Google Drive
+        env:
+          GDRIVE_DEST: ${{ secrets.GDRIVE_DEST }}
+          CHANNEL: ${{ needs.discover.outputs.channel }}
+          ARCHIVE_PREFIX: ${{ needs.discover.outputs.prefix }}
+        run: |
+          set -euo pipefail
+
+          # تحديد المسار الأساسي
+          if [ -n "$GDRIVE_DEST" ]; then
+            BASE="$GDRIVE_DEST"
+          else
+            BASE="gdrive:Telegram3D/${CHANNEL}/${ARCHIVE_PREFIX}"
+          fi
+
+          echo "📤 رفع الأرشيفات الأصلية إلى: $BASE/archives/"
+          rclone copy telegram_cache "$BASE/archives/" \
+            --drive-chunk-size 64M \
+            --transfers 8 \
+            --checkers 16 \
+            --retries 5 \
+            --low-level-retries 10 \
+            --drive-use-trash=false \
+            --verbose
+
+          echo "📤 رفع الملفات المفكوكة إلى: $BASE/extracted/"
+          rclone copy extracted "$BASE/extracted/" \
+            --drive-chunk-size 64M \
+            --transfers 8 \
+            --checkers 16 \
+            --retries 5 \
+            --low-level-retries 10 \
+            --drive-use-trash=false \
+            --verbose
+
+          # رفع التقارير
+          mkdir -p reports_upload
+          if [ -f extraction-log.json ]; then cp extraction-log.json reports_upload/; fi
+          if [ -f analysis.json ]; then cp analysis.json reports_upload/; fi
+          if [ -n "$(ls -A reports_upload)" ]; then
+            echo "📤 رفع التقارير إلى: $BASE/reports/"
+            rclone copy reports_upload "$BASE/reports/" \
+              --drive-chunk-size 16M \
+              --transfers 4 \
+              --checkers 8 \
+              --retries 3 \
+              --drive-use-trash=false \
+              --verbose
+          fi
+
+          echo "✅ تم رفع جميع الملفات إلى Google Drive"
+
+      - name: Optional cleanup of original archives
+        if: inputs.delete_archives_after_upload == true
+        run: |
+          echo "حذف الأرشيفات الأصلية من مساحة العمل..."
+          rm -rf telegram_cache telegram_partial
+          echo "تم الحذف"
+
 
   # ============================================================
-  # JOB 4 — ANALYSIS
+  # JOB 4 — SUMMARY
   # ============================================================
-
   analyze:
-
     needs:
-      - discover
       - extract
-
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: always()
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download extracted workspace
-        uses: actions/upload-artifact@v4
-        with:
-          name: extraction-state
-          path: |
-            extracted
-            extraction-log.json
-          retention-days: 7
+      - name: Print summary
+        run: |
+          echo "📊 انتهى سير العمل"
+          echo "الحالة: ${{ needs.extract.result }}"
+          echo "القناة: ${{ needs.discover.outputs.channel }}"
+          echo "البادئة: ${{ needs.discover.outputs.prefix }}"
+          echo "تم رفع الأرشيفات الأصلية والملفات المفكوكة إلى Google Drive"
+
+
+  # ============================================================
+  # JOB 5 — NOTIFICATION
+  # ============================================================
+  notify:
+    needs: [preflight, discover, download, extract, analyze]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send Telegram notification (optional)
+        if: secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ needs.extract.result }}
+          CHANNEL: ${{ needs.discover.outputs.channel }}
+          PREFIX: ${{ needs.discover.outputs.prefix }}
+        run: |
+          STATUS_EMOJI="✅"
+          if [ "$STATUS" != "success" ]; then STATUS_EMOJI="❌"; fi
+          MESSAGE="${STATUS_EMOJI} اكتمل استيراد ${PREFIX} من ${CHANNEL} إلى Google Drive (الأرشيفات والمفكوك)"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+               -d chat_id="${TELEGRAM_CHAT_ID}" \
+               -d text="${MESSAGE}" || true
