@@ -130,7 +130,6 @@ jobs:
           echo "MESSAGE_ID=${{ inputs.message_id }}" >> "$GITHUB_ENV"
           echo "message_id=${{ inputs.message_id }}" >> "$GITHUB_OUTPUT"
 
-          # إذا كان max_depth = 0 يعني غير محدود، نضع قيمة كبيرة جدًا
           DEPTH="${{ inputs.max_depth }}"
           if [ "$DEPTH" == "0" ]; then
             DEPTH="999999"
@@ -854,7 +853,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # تحديد المسار الأساسي
           if [ -n "$GDRIVE_DEST" ]; then
             BASE="$GDRIVE_DEST"
           else
@@ -881,7 +879,6 @@ jobs:
             --drive-use-trash=false \
             --verbose
 
-          # رفع التقارير
           mkdir -p reports_upload
           if [ -f extraction-log.json ]; then cp extraction-log.json reports_upload/; fi
           if [ -f analysis.json ]; then cp analysis.json reports_upload/; fi
@@ -940,7 +937,6 @@ jobs:
 
     steps:
       - name: Send Telegram notification (optional)
-        if: secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -948,6 +944,12 @@ jobs:
           CHANNEL: ${{ needs.discover.outputs.channel }}
           PREFIX: ${{ needs.discover.outputs.prefix }}
         run: |
+          # التحقق من وجود الأسرار داخل السكربت بدلاً من if
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets غير موجودة، تم تخطي الإشعار."
+            exit 0
+          fi
+
           STATUS_EMOJI="✅"
           if [ "$STATUS" != "success" ]; then STATUS_EMOJI="❌"; fi
           MESSAGE="${STATUS_EMOJI} اكتمل استيراد ${PREFIX} من ${CHANNEL} إلى Google Drive (الأرشيفات والمفكوك)"
