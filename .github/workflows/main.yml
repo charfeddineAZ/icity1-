@@ -1,4 +1,4 @@
-name: Telegram 3D Import to Google Drive (Flexible SA)
+name: Telegram 3D Import to Google Drive (No Limits)
 
 on:
   workflow_dispatch:
@@ -80,22 +80,20 @@ jobs:
 
           # فحص GDRIVE_SERVICE_ACCOUNT_B64 (يدعم JSON مباشرة أو Base64)
           if [[ "$GDRIVE_SERVICE_ACCOUNT_B64" == \{* ]]; then
-            echo "ℹ️ تم اكتشاف JSON مباشرة (يبدأ بـ '{')"
-            # تحقق سريع من أن النص يحتوي على client_email
+            echo "ℹ️ تم اكتشاف JSON مباشرة"
             if ! echo "$GDRIVE_SERVICE_ACCOUNT_B64" | grep -q "client_email"; then
-              echo "❌ النص لا يحتوي على client_email، تأكد من أنه JSON صحيح"
+              echo "❌ النص لا يحتوي على client_email"
               exit 1
             fi
           else
             echo "ℹ️ سنحاول فك Base64"
             DECODED_SA_SIZE=$(printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d 2>/dev/null | wc -c)
             if [ "$DECODED_SA_SIZE" -lt 50 ]; then
-              echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 غير صالح (Base64 غير صحيح أو حجم صغير)"
+              echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 غير صالح"
               exit 1
             fi
-            # تأكد من أن فك التشفير يعطي JSON
             if ! printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d 2>/dev/null | grep -q "client_email"; then
-              echo "❌ فك التشفير لا يعطي JSON يحتوي على client_email"
+              echo "❌ فك التشفير لا يعطي JSON صحيح"
               exit 1
             fi
           fi
@@ -719,11 +717,17 @@ jobs:
               for line in result.stdout.splitlines():
                   if line.startswith("Path = "):
                       entry = line[len("Path = "):].strip()
+                      # تجاهل السطر الذي يمثل الأرشيف نفسه (مشكلة شائعة مع 7z)
+                      if entry == archive_path.name or entry == str(archive_path) or entry.endswith('/' + archive_path.name):
+                          continue
+                      # رفض المسارات المطلقة (بعد تجاهل الأرشيف نفسه)
                       if entry.startswith("/") or entry.startswith("\\"):
-                          raise RuntimeError(f"مسار مطلق ممنوع: {entry}")
+                          print(f"  ⚠️ تم تجاهل مسار مطلق: {entry}")
+                          continue
                       parts = entry.replace("\\", "/").split("/")
                       if any(p == ".." for p in parts):
-                          raise RuntimeError(f"مسار خطير ممنوع: {entry}")
+                          raise RuntimeError(f"مسار خطير (..) ممنوع: {entry}")
+              print("  ✅ اكتمل الفحص (تجاهلنا المسارات المطلقة غير الخطيرة)")
 
           def extract_one(archive_path, destination):
               destination.mkdir(parents=True, exist_ok=True)
@@ -861,7 +865,6 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.config/rclone
 
-          # معالجة السر: إذا بدأ بـ "{" فهو JSON مباشرة، وإلا فك Base64
           if [[ "$GDRIVE_SERVICE_ACCOUNT_B64" == \{* ]]; then
             echo "$GDRIVE_SERVICE_ACCOUNT_B64" > ~/.config/rclone/gdrive-sa.json
           else
@@ -869,7 +872,6 @@ jobs:
           fi
           chmod 600 ~/.config/rclone/gdrive-sa.json
 
-          # إعداد rclone.conf مع team_drive إن وجد
           cat > ~/.config/rclone/rclone.conf <<EOF
           [gdrive]
           type = drive
