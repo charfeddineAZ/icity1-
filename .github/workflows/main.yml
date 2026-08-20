@@ -1,4 +1,4 @@
-name: Telegram 3D Import to Google Drive (No Limits)
+name: Telegram 3D Import to GitLab
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ on:
         default: false
 
       delete_archives_after_upload:
-        description: "حذف الأرشيفات الأصلية بعد رفعها إلى Drive"
+        description: "حذف الأرشيفات الأصلية بعد رفعها إلى GitLab"
         required: true
         type: boolean
         default: false
@@ -63,40 +63,28 @@ jobs:
           TELEGRAM_SESSION_B64: ${{ secrets.TELEGRAM_SESSION_B64 }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          GDRIVE_SERVICE_ACCOUNT_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_B64 }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -euo pipefail
           test -n "$TELEGRAM_SESSION_B64" || { echo "❌ TELEGRAM_SESSION_B64 مفقود"; exit 1; }
           test -n "$TELEGRAM_API_ID" || { echo "❌ TELEGRAM_API_ID مفقود"; exit 1; }
           test -n "$TELEGRAM_API_HASH" || { echo "❌ TELEGRAM_API_HASH مفقود"; exit 1; }
-          test -n "$GDRIVE_SERVICE_ACCOUNT_B64" || { echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 مفقود"; exit 1; }
+          test -n "$GITLAB_TOKEN" || { echo "❌ GITLAB_TOKEN مفقود"; exit 1; }
+          test -n "$GITLAB_REPO_URL" || { echo "❌ GITLAB_REPO_URL مفقود"; exit 1; }
 
-          # فحص TELEGRAM_SESSION_B64
           DECODED_SIZE=$(printf '%s' "$TELEGRAM_SESSION_B64" | base64 -d 2>/dev/null | wc -c)
           if [ "$DECODED_SIZE" -lt 10 ]; then
             echo "❌ TELEGRAM_SESSION_B64 غير صالح"
             exit 1
           fi
 
-          # فحص GDRIVE_SERVICE_ACCOUNT_B64 (يدعم JSON مباشرة أو Base64)
-          if [[ "$GDRIVE_SERVICE_ACCOUNT_B64" == \{* ]]; then
-            echo "ℹ️ تم اكتشاف JSON مباشرة"
-            if ! echo "$GDRIVE_SERVICE_ACCOUNT_B64" | grep -q "client_email"; then
-              echo "❌ النص لا يحتوي على client_email"
-              exit 1
-            fi
-          else
-            echo "ℹ️ سنحاول فك Base64"
-            DECODED_SA_SIZE=$(printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d 2>/dev/null | wc -c)
-            if [ "$DECODED_SA_SIZE" -lt 50 ]; then
-              echo "❌ GDRIVE_SERVICE_ACCOUNT_B64 غير صالح"
-              exit 1
-            fi
-            if ! printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d 2>/dev/null | grep -q "client_email"; then
-              echo "❌ فك التشفير لا يعطي JSON صحيح"
-              exit 1
-            fi
+          # فحص صيغة رابط المستودع
+          if [[ ! "$GITLAB_REPO_URL" =~ ^https?:// ]]; then
+            echo "❌ GITLAB_REPO_URL يجب أن يبدأ بـ http:// أو https://"
+            exit 1
           fi
+
           echo "✅ جميع الأسرار الإلزامية موجودة وصالحة"
 
       - name: Validate numeric inputs
@@ -570,7 +558,7 @@ jobs:
 
 
   # ============================================================
-  # JOB 3 — EXTRACT & UPLOAD TO GOOGLE DRIVE
+  # JOB 3 — EXTRACT & PUSH TO GITLAB
   # ============================================================
   extract:
     needs:
@@ -607,7 +595,7 @@ jobs:
           key: ${{ needs.download.outputs.cache_key }}
           fail-on-cache-miss: true
 
-      - name: Install archive tools and rclone (resilient)
+      - name: Install archive tools (resilient)
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -621,27 +609,17 @@ jobs:
 
           echo "📦 تثبيت الأدوات..."
           sudo apt-get install -y --no-install-recommends \
-            p7zip-full p7zip-rar unrar unzip jq file tree rclone \
+            p7zip-full p7zip-rar unrar unzip jq file tree \
             -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 \
             -o Acquire::Retries=3 \
             -o Acquire::ForceIPv4=true \
             || {
               echo "❌ فشل التثبيت من المستودعات، محاولة بديلة..."
-              sudo apt-get install -y p7zip-full unrar unzip rclone
+              sudo apt-get install -y p7zip-full unrar unzip
             }
 
-          # إذا لم يتوفر rclone، ثبتّه يدويًا
-          if ! command -v rclone >/dev/null; then
-            echo "⚠️ rclone غير موجود، تثبيت يدوي..."
-            curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-            unzip rclone-current-linux-amd64.zip
-            cd rclone-*-linux-amd64
-            sudo cp rclone /usr/local/bin/
-            cd ..
-          fi
-
-          echo "✅ تم تثبيت الأدوات"
+          echo "✅ تم تثبيت أدوات الأرشيف"
 
       - name: Test real archives only (non-blocking)
         run: |
@@ -737,17 +715,15 @@ jobs:
               for line in result.stdout.splitlines():
                   if line.startswith("Path = "):
                       entry = line[len("Path = "):].strip()
-                      # تجاهل السطر الذي يمثل الأرشيف نفسه (مشكلة شائعة مع 7z)
                       if entry == archive_path.name or entry == str(archive_path) or entry.endswith('/' + archive_path.name):
                           continue
-                      # رفض المسارات المطلقة (بعد تجاهل الأرشيف نفسه)
                       if entry.startswith("/") or entry.startswith("\\"):
                           print(f"  ⚠️ تم تجاهل مسار مطلق: {entry}")
                           continue
                       parts = entry.replace("\\", "/").split("/")
                       if any(p == ".." for p in parts):
                           raise RuntimeError(f"مسار خطير (..) ممنوع: {entry}")
-              print("  ✅ اكتمل الفحص (تجاهلنا المسارات المطلقة غير الخطيرة)")
+              print("  ✅ اكتمل الفحص")
 
           def extract_one(archive_path, destination):
               destination.mkdir(parents=True, exist_ok=True)
@@ -760,8 +736,6 @@ jobs:
               )
               if result.returncode != 0:
                   print(f"⚠️ فشل استخراج {archive_path} (كود {result.returncode})")
-                  print("Stdout:", result.stdout[-500:])
-                  print("Stderr:", result.stderr[-500:])
                   raise RuntimeError(f"فشل استخراج {archive_path}")
               for p in destination.rglob("*"):
                   if p.is_symlink():
@@ -877,80 +851,50 @@ jobs:
           print(json.dumps(report, indent=2))
           PY
 
-      - name: Configure rclone for Google Drive (يدعم JSON مباشرة أو Base64)
+      - name: Push archives and extracted files to GitLab
         env:
-          GDRIVE_SERVICE_ACCOUNT_B64: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_B64 }}
-          GDRIVE_TEAM_DRIVE: ${{ secrets.GDRIVE_TEAM_DRIVE }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.config/rclone
-
-          if [[ "$GDRIVE_SERVICE_ACCOUNT_B64" == \{* ]]; then
-            echo "$GDRIVE_SERVICE_ACCOUNT_B64" > ~/.config/rclone/gdrive-sa.json
-          else
-            printf '%s' "$GDRIVE_SERVICE_ACCOUNT_B64" | base64 -d > ~/.config/rclone/gdrive-sa.json
-          fi
-          chmod 600 ~/.config/rclone/gdrive-sa.json
-
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = $HOME/.config/rclone/gdrive-sa.json
-          team_drive = $GDRIVE_TEAM_DRIVE
-          EOF
-
-          echo "✅ تم إعداد rclone"
-
-      - name: Upload archives and extracted files to Google Drive
-        env:
-          GDRIVE_DEST: ${{ secrets.GDRIVE_DEST }}
-          CHANNEL: ${{ needs.discover.outputs.channel }}
-          ARCHIVE_PREFIX: ${{ needs.discover.outputs.prefix }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_REPO_URL: ${{ secrets.GITLAB_REPO_URL }}
         run: |
           set -euo pipefail
 
-          if [ -n "$GDRIVE_DEST" ]; then
-            BASE="$GDRIVE_DEST"
-          else
-            BASE="gdrive:Telegram3D/${CHANNEL}/${ARCHIVE_PREFIX}"
+          # إعداد بيانات الدخول
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+          # استنساخ المستودع
+          CLEAN_URL="${GITLAB_REPO_URL/https:\/\//https:\/\/oauth2:${GITLAB_TOKEN}@}"
+          CLEAN_URL="${CLEAN_URL/http:\/\//http:\/\/oauth2:${GITLAB_TOKEN}@}"
+          git clone --depth 1 "$CLEAN_URL" gitlab_repo
+          cd gitlab_repo
+
+          # إنشاء مجلدات للحفظ
+          mkdir -p archives extracted reports
+
+          # نسخ الأرشيفات الأصلية
+          if [ -d "../telegram_cache" ]; then
+            cp -r ../telegram_cache/* archives/
           fi
 
-          echo "📤 رفع الأرشيفات الأصلية إلى: $BASE/archives/"
-          rclone copy telegram_cache "$BASE/archives/" \
-            --drive-chunk-size 64M \
-            --transfers 8 \
-            --checkers 16 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --drive-use-trash=false \
-            --verbose
-
-          echo "📤 رفع الملفات المفكوكة إلى: $BASE/extracted/"
-          rclone copy extracted "$BASE/extracted/" \
-            --drive-chunk-size 64M \
-            --transfers 8 \
-            --checkers 16 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --drive-use-trash=false \
-            --verbose
-
-          mkdir -p reports_upload
-          if [ -f extraction-log.json ]; then cp extraction-log.json reports_upload/; fi
-          if [ -f analysis.json ]; then cp analysis.json reports_upload/; fi
-          if [ -n "$(ls -A reports_upload)" ]; then
-            echo "📤 رفع التقارير إلى: $BASE/reports/"
-            rclone copy reports_upload "$BASE/reports/" \
-              --drive-chunk-size 16M \
-              --transfers 4 \
-              --checkers 8 \
-              --retries 3 \
-              --drive-use-trash=false \
-              --verbose
+          # نسخ الملفات المفكوكة
+          if [ -d "../extracted" ]; then
+            cp -r ../extracted/* extracted/
           fi
 
-          echo "✅ تم رفع جميع الملفات إلى Google Drive"
+          # نسخ التقارير
+          if [ -f "../extraction-log.json" ]; then
+            cp ../extraction-log.json reports/
+          fi
+          if [ -f "../analysis.json" ]; then
+            cp ../analysis.json reports/
+          fi
+
+          # إضافة الملفات وcommit وpush
+          git add .
+          git commit -m "Import ${CHANNEL} ${ARCHIVE_PREFIX} - $(date -u +%Y%m%d%H%M%S)" || echo "لا توجد تغييرات"
+          git push origin HEAD:main || git push origin HEAD:master
+
+          echo "✅ تم رفع جميع الملفات إلى GitLab"
 
       - name: Optional cleanup of original archives
         if: inputs.delete_archives_after_upload == true
@@ -980,7 +924,7 @@ jobs:
           echo "الحالة: ${{ needs.extract.result }}"
           echo "القناة: ${{ needs.discover.outputs.channel }}"
           echo "البادئة: ${{ needs.discover.outputs.prefix }}"
-          echo "تم رفع الأرشيفات الأصلية والملفات المفكوكة إلى Google Drive"
+          echo "تم رفع الأرشيفات الأصلية والملفات المفكوكة إلى GitLab"
 
 
   # ============================================================
@@ -1008,7 +952,7 @@ jobs:
 
           STATUS_EMOJI="✅"
           if [ "$STATUS" != "success" ]; then STATUS_EMOJI="❌"; fi
-          MESSAGE="${STATUS_EMOJI} اكتمل استيراد ${PREFIX} من ${CHANNEL} إلى Google Drive (الأرشيفات والمفكوك)"
+          MESSAGE="${STATUS_EMOJI} اكتمل استيراد ${PREFIX} من ${CHANNEL} إلى GitLab (الأرشيفات والمفكوك)"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                -d chat_id="${TELEGRAM_CHAT_ID}" \
                -d text="${MESSAGE}" || true
